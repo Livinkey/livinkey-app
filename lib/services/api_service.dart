@@ -1,0 +1,1792 @@
+// lib/services/api_service.dart
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+import 'package:dio/dio.dart';
+import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import '../utils/constants.dart';
+import '../models/auth_models.dart';
+import 'session_manager.dart';
+
+class ApiService {
+  static final ApiService _instance = ApiService._internal();
+  factory ApiService() => _instance;
+  ApiService._internal();
+
+  late Dio _dio;
+  String? _token;
+  String? _role;
+
+  // The login token lives in the platform keystore, not in plain preferences.
+  static const FlutterSecureStorage _secure = FlutterSecureStorage(
+    aOptions: AndroidOptions(encryptedSharedPreferences: true),
+  );
+
+  Dio get dio => _dio;
+
+  /// Reads the token from secure storage (migrating an old plain-text token once).
+  Future<String?> _loadToken() async {
+    try {
+      var token = await _secure.read(key: kStorageToken);
+      if (token == null || token.isEmpty) {
+        final prefs = await SharedPreferences.getInstance();
+        final legacy = prefs.getString(kStorageToken);
+        if (legacy != null && legacy.isNotEmpty) {
+          await _secure.write(key: kStorageToken, value: legacy);
+          await prefs.remove(kStorageToken);
+          token = legacy;
+        }
+      }
+      return (token != null && token.isNotEmpty) ? token : null;
+    } catch (_) {
+      // Keystore hiccup: fall back to whatever we have in memory. Never log the user out for this.
+      return _token;
+    }
+  }
+
+  static const Set<String> _sessionEndCodes = {
+    'TOKEN_EXPIRED',
+    'TOKEN_INVALID',
+    'ACCOUNT_DISABLED',
+    'ACCOUNT_BLOCKED',
+  };
+
+  static bool _isRetryable(DioException e) {
+    if (e.requestOptions.method.toUpperCase() != 'GET') return false;
+    return e.type == DioExceptionType.connectionTimeout ||
+        e.type == DioExceptionType.receiveTimeout ||
+        e.type == DioExceptionType.connectionError ||
+        (e.response?.statusCode != null &&
+            const [502, 503, 504].contains(e.response!.statusCode));
+  }
+
+  Future<void> init() async {
+    final prefs = await SharedPreferences.getInstance();
+    _token = await _loadToken();
+    _role = prefs.getString(kStorageRole);
+
+    _dio = Dio(BaseOptions(
+      baseUrl: kApiBaseUrl,
+      // Slow mobile networks (India 3G/weak Wi-Fi) often need >30s.
+      connectTimeout: const Duration(seconds: 30),
+      receiveTimeout: const Duration(seconds: 45),
+      sendTimeout: const Duration(seconds: 60),
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+    ));
+
+    _dio.interceptors.add(InterceptorsWrapper(
+      onRequest: (options, handler) async {
+        _token ??= await _loadToken();
+        final token = _token;
+        if (token != null && token.isNotEmpty) {
+          options.headers['Authorization'] = 'Bearer $token';
+        }
+        options.headers['Cache-Control'] = 'no-cache';
+        return handler.next(options);
+      },
+      onError: (error, handler) async {
+        // ---- 1. Smooth over flaky networks: retry GET requests quietly ----
+        if (_isRetryable(error)) {
+          final attempt = (error.requestOptions.extra['retry_attempt'] as int?) ?? 0;
+          if (attempt < 2) {
+            await Future<void>.delayed(Duration(milliseconds: 700 * (attempt + 1)));
+            error.requestOptions.extra['retry_attempt'] = attempt + 1;
+            try {
+              final response = await _dio.fetch<dynamic>(error.requestOptions);
+              return handler.resolve(response);
+            } on DioException catch (e) {
+              return handler.next(e);
+            }
+          }
+        }
+
+        // ---- 2. Session handling ----
+        // The user is signed out ONLY when the server explicitly says the
+        // session is over (token expired after the backend-defined number of
+        // days, token invalid, or account deactivated). Wrong passwords,
+        // missing permissions, timeouts, 5xx errors etc. never sign anyone out.
+        if (error.response?.statusCode == 401) {
+          final data = error.response?.data;
+          final code = data is Map ? data['code']?.toString() : null;
+          final sentAuth = error.requestOptions.headers['Authorization']?.toString();
+          // Ignore answers to requests that were sent with an older token
+          // (for example right after logging in again).
+          final isStale = sentAuth != null && _token != null && sentAuth != 'Bearer $_token';
+          if (code != null && _sessionEndCodes.contains(code) && !isStale) {
+            final message = data is Map && data['message'] != null
+                ? data['message'].toString()
+                : 'Your session has ended. Please sign in again.';
+            await SessionManager().endSession(message);
+          }
+        }
+        return handler.next(error);
+      },
+    ));
+  }
+
+  Future<void> setToken(String token, {String? role}) async {
+    _token = token;
+    _role = role;
+    SessionManager().reset();
+    try {
+      await _secure.write(key: kStorageToken, value: token);
+    } catch (_) {}
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(kStorageToken); // never keep a plain-text copy
+    if (role != null) {
+      await prefs.setString(kStorageRole, role);
+    }
+  }
+
+  Future<void> clearToken() async {
+    _token = null;
+    _role = null;
+    try {
+      await _secure.delete(key: kStorageToken);
+    } catch (_) {}
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(kStorageToken);
+    await prefs.remove(kStorageRole);
+    await prefs.remove(kStorageUser);
+  }
+
+  Future<String?> getToken() async {
+    _token ??= await _loadToken();
+    return _token;
+  }
+
+  String? get token => _token;
+  String? get role => _role;
+
+  bool get isAuthenticated => _token != null && _token!.isNotEmpty;
+
+  Future<void> saveUser(UserModel user) async {
+    final prefs = await SharedPreferences.getInstance();
+    final userJson = jsonEncode(user.toJson());
+    await prefs.setString(kStorageUser, userJson);
+  }
+
+  Future<UserModel?> getUser() async {
+    final prefs = await SharedPreferences.getInstance();
+    final userJson = prefs.getString(kStorageUser);
+    if (userJson != null) {
+      try {
+        return UserModel.fromJson(jsonDecode(userJson));
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  }
+
+  Future<bool> isLoggedIn() async {
+    final prefs = await SharedPreferences.getInstance();
+    final token = await getToken();
+    final user = prefs.getString(kStorageUser);
+    return token != null && token.isNotEmpty && user != null;
+  }
+
+  Future<String?> getStoredRole() async {
+    final prefs = await SharedPreferences.getInstance();
+    return prefs.getString(kStorageRole);
+  }
+
+  Future<bool> switchToRole(String newRole) async {
+    final prefs = await SharedPreferences.getInstance();
+    final userJson = prefs.getString(kStorageUser);
+    if (userJson == null) return false;
+    
+    try {
+      final user = jsonDecode(userJson);
+      user['role'] = newRole;
+      await prefs.setString(kStorageUser, jsonEncode(user));
+      await prefs.setString(kStorageRole, newRole);
+      _role = newRole;
+      return true;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  // ============================================================
+  // SAFE TYPE PARSING HELPERS
+  // ============================================================
+  
+  static int _parseInt(dynamic value) {
+    if (value == null) return 0;
+    if (value is int) return value;
+    if (value is double) return value.toInt();
+    if (value is String) {
+      final trimmed = value.trim();
+      if (trimmed.isEmpty) return 0;
+      return int.tryParse(trimmed) ?? 0;
+    }
+    if (value is bool) return value ? 1 : 0;
+    return 0;
+  }
+
+  static double _parseDouble(dynamic value) {
+    if (value == null) return 0.0;
+    if (value is double) return value;
+    if (value is int) return value.toDouble();
+    if (value is String) {
+      final trimmed = value.trim();
+      if (trimmed.isEmpty) return 0.0;
+      return double.tryParse(trimmed) ?? 0.0;
+    }
+    if (value is bool) return value ? 1.0 : 0.0;
+    return 0.0;
+  }
+
+  static bool _parseBool(dynamic value) {
+    if (value == null) return false;
+    if (value is bool) return value;
+    if (value is int) return value == 1;
+    if (value is String) {
+      final lower = value.toLowerCase();
+      return lower == 'true' || lower == '1';
+    }
+    return false;
+  }
+
+  // ============================================================
+  // NETWORK HELPERS (slow devices / flaky mobile networks)
+  // ============================================================
+
+  /// True for errors that often succeed on a quick retry.
+  static bool _isTransientNetworkError(DioException e) {
+    return e.type == DioExceptionType.connectionTimeout ||
+        e.type == DioExceptionType.sendTimeout ||
+        e.type == DioExceptionType.receiveTimeout ||
+        e.type == DioExceptionType.connectionError ||
+        e.type == DioExceptionType.unknown;
+  }
+
+  /// User-facing message for Dio failures (login/signup and general API).
+  static String mapDioError(DioException e, {String fallback = 'Something went wrong. Please try again.'}) {
+    final status = e.response?.statusCode;
+    final data = e.response?.data;
+
+    // Prefer the server's own (already user-friendly) message for client errors.
+    if (data is Map && data['message'] != null && (status == null || status < 500)) {
+      final m = data['message'].toString().trim();
+      if (m.isNotEmpty) return m;
+    }
+    if (status != null && status >= 500) {
+      return status == 502 || status == 503 || status == 504
+          ? 'The server is temporarily unavailable. Please try again in a moment.'
+          : 'Something went wrong on our side. Please try again shortly.';
+    }
+
+    switch (e.type) {
+      case DioExceptionType.connectionTimeout:
+      case DioExceptionType.sendTimeout:
+      case DioExceptionType.receiveTimeout:
+        return 'The connection is slow right now. Please try again.';
+      case DioExceptionType.connectionError:
+        return 'You appear to be offline. Check your internet connection and try again.';
+      case DioExceptionType.cancel:
+        return 'Request cancelled.';
+      default:
+        final msg = e.message?.toLowerCase() ?? '';
+        if (msg.contains('socket') ||
+            msg.contains('failed host lookup') ||
+            msg.contains('network is unreachable') ||
+            msg.contains('connection refused') ||
+            msg.contains('connection reset')) {
+          return 'You appear to be offline. Check your internet connection and try again.';
+        }
+        return fallback;
+    }
+  }
+
+  /// Exchanges the session token for a 5-minute download token so the real
+  /// token never appears in a URL. [scope] is 'tenant' or 'guest'.
+  Future<String?> getDownloadToken({String? scope}) async {
+    try {
+      final r = (scope ?? (_role == 'guest' ? 'guest' : 'tenant'));
+      final response = await _dio.post('/download-token/$r');
+      final data = response.data;
+      if (data is Map && data['token'] != null) return data['token'].toString();
+    } catch (_) {}
+    return null;
+  }
+
+  /// Builds a browser-openable URL for a protected file using a short-lived token.
+  Future<String?> buildAuthorizedUrl(String path, {String? scope}) async {
+    final t = await getDownloadToken(scope: scope);
+    if (t == null) return null;
+    final sep = path.contains('?') ? '&' : '?';
+    return '$kApiBaseUrl$path${sep}token=${Uri.encodeComponent(t)}';
+  }
+
+  /// POST with up to [maxAttempts] tries on transient network errors.
+  Future<Response<dynamic>> _postWithRetry(
+    String path, {
+    dynamic data,
+    int maxAttempts = 3,
+  }) async {
+    DioException? lastError;
+    for (var attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        return await _dio.post(path, data: data);
+      } on DioException catch (e) {
+        lastError = e;
+        // Do not retry when the server already answered (4xx/5xx body)
+        if (e.response != null) rethrow;
+        if (!_isTransientNetworkError(e) || attempt == maxAttempts) rethrow;
+        // Brief backoff: 800ms, 1600ms, ...
+        await Future<void>.delayed(Duration(milliseconds: 800 * attempt));
+      }
+    }
+    throw lastError!;
+  }
+
+  // ============================================================
+  // TENANT HOME
+  // ============================================================
+  Future<Map<String, dynamic>> getTenantHome() async {
+    try {
+      // No need to call getToken() - interceptor will get it from SharedPreferences
+      final response = await _dio.get('/tenants/home');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // Tenant Login (retries on transient network failures)
+  Future<LoginResponse> tenantLogin(String email, String password) async {
+    try {
+      final response = await _postWithRetry('/tenants/auth/login', data: {
+        'email': email,
+        'password': password,
+      });
+      return LoginResponse.fromJson(response.data is Map
+          ? Map<String, dynamic>.from(response.data as Map)
+          : {'success': false, 'message': 'Invalid server response'});
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        try {
+          return LoginResponse.fromJson(
+            e.response!.data is Map
+                ? Map<String, dynamic>.from(e.response!.data as Map)
+                : {'success': false, 'message': mapDioError(e)},
+          );
+        } catch (_) {
+          return LoginResponse(success: false, message: mapDioError(e));
+        }
+      }
+      return LoginResponse(success: false, message: mapDioError(e));
+    } catch (e) {
+      return LoginResponse(
+        success: false,
+        message: 'Something went wrong. Please try again.',
+      );
+    }
+  }
+
+  // Guest Login (retries on transient network failures)
+  Future<LoginResponse> guestLogin(String email, String password) async {
+    try {
+      final response = await _postWithRetry('/guests/login', data: {
+        'email': email,
+        'password': password,
+      });
+      return LoginResponse.fromJson(response.data is Map
+          ? Map<String, dynamic>.from(response.data as Map)
+          : {'success': false, 'message': 'Invalid server response'});
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        try {
+          return LoginResponse.fromJson(
+            e.response!.data is Map
+                ? Map<String, dynamic>.from(e.response!.data as Map)
+                : {'success': false, 'message': mapDioError(e)},
+          );
+        } catch (_) {
+          return LoginResponse(success: false, message: mapDioError(e));
+        }
+      }
+      return LoginResponse(success: false, message: mapDioError(e));
+    } catch (e) {
+      return LoginResponse(
+        success: false,
+        message: 'Something went wrong. Please try again.',
+      );
+    }
+  }
+
+  // Guest Register (retries on transient network failures)
+  Future<Map<String, dynamic>> guestRegister(Map<String, dynamic> data) async {
+    try {
+      final response = await _postWithRetry('/guests/register', data: data);
+      if (response.data is Map) {
+        return Map<String, dynamic>.from(response.data as Map);
+      }
+      return {'success': false, 'message': 'Invalid server response'};
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null && e.response!.data is Map) {
+        return Map<String, dynamic>.from(e.response!.data as Map);
+      }
+      return {'success': false, 'message': mapDioError(e)};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // Guest Forgot Password
+  Future<Map<String, dynamic>> guestForgotPassword(String email) async {
+    try {
+      final response = await _dio.post('/guests/forgot-password', data: {
+        'email': email,
+      });
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // Guest Verify OTP
+  Future<OtpResponse> guestVerifyOTP(String email, String otp) async {
+    try {
+      final response = await _dio.post('/guests/verify-otp', data: {
+        'email': email,
+        'otp': otp,
+      });
+      return OtpResponse.fromJson(response.data);
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return OtpResponse.fromJson(e.response!.data);
+      }
+      return OtpResponse(
+        success: false,
+        message: 'You appear to be offline. Check your connection and try again.',
+      );
+    } catch (e) {
+      return OtpResponse(
+        success: false,
+        message: 'Something went wrong. Please try again.',
+      );
+    }
+  }
+
+  // Guest Reset Password
+  Future<Map<String, dynamic>> guestResetPassword(String resetToken, String newPassword, String confirmPassword) async {
+    try {
+      final response = await _dio.post('/guests/reset-password', data: {
+        'resetToken': resetToken,
+        'new_password': newPassword,
+        'confirm_password': confirmPassword,
+      });
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // Tenant Forgot Password
+  Future<Map<String, dynamic>> tenantForgotPassword(String email) async {
+    try {
+      final response = await _dio.post('/tenants/auth/forgot-password', data: {
+        'email': email,
+      });
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // Tenant Verify OTP
+  Future<OtpResponse> tenantVerifyOTP(String email, String otp) async {
+    try {
+      final response = await _dio.post('/tenants/auth/verify-otp', data: {
+        'email': email,
+        'otp': otp,
+      });
+      return OtpResponse.fromJson(response.data);
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return OtpResponse.fromJson(e.response!.data);
+      }
+      return OtpResponse(
+        success: false,
+        message: 'You appear to be offline. Check your connection and try again.',
+      );
+    } catch (e) {
+      return OtpResponse(
+        success: false,
+        message: 'Something went wrong. Please try again.',
+      );
+    }
+  }
+
+  // Tenant Reset Password
+  Future<Map<String, dynamic>> tenantResetPassword(String resetToken, String newPassword, String confirmPassword) async {
+    try {
+      final response = await _dio.post('/tenants/auth/reset-password', data: {
+        'resetToken': resetToken,
+        'new_password': newPassword,
+        'confirm_password': confirmPassword,
+      });
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // Tenant Change Password
+  Future<Map<String, dynamic>> tenantChangePassword(String currentPassword, String newPassword, String confirmPassword) async {
+    try {
+      final response = await _dio.post('/tenants/auth/change-password', data: {
+        'current_password': currentPassword,
+        'new_password': newPassword,
+        'confirm_password': confirmPassword,
+      });
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ TENANT ENDPOINTS ============
+
+  Future<Map<String, dynamic>> getLivinkeyAds() async {
+    try {
+      final response = await _dio.get('/livinkey-ads/tenant');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) return e.response!.data;
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (_) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getLivinkeyNotices() async {
+    try {
+      final response = await _dio.get('/livinkey-notices/tenant');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) return e.response!.data;
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (_) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getTenantAgreement() async {
+    try {
+      final response = await _dio.get('/tenants/agreement');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) return e.response!.data;
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (_) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> acceptTenantAgreement() async {
+    try {
+      final response = await _dio.post('/tenants/agreement/accept');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) return e.response!.data;
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (_) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  /// Returns a browser-openable URL for the tenant's accepted agreement PDF.
+  Future<Map<String, dynamic>> getTenantAgreementPdfUrl() async {
+    try {
+      final url = await buildAuthorizedUrl('/tenants/agreement/pdf', scope: 'tenant');
+      if (url == null) {
+        return {'success': false, 'message': 'We could not prepare the agreement right now. Please try again.'};
+      }
+      return {'success': true, 'url': url};
+    } catch (e) {
+      return {'success': false, 'message': 'We could not prepare the agreement right now. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getTenantProfile() async {
+    try {
+      final response = await _dio.get('/tenants/profile');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ GUEST ENDPOINTS ============
+
+  Future<Map<String, dynamic>> getGuestDashboard() async {
+    try {
+      final response = await _dio.get(
+        '/guests/dashboard',
+        options: Options(
+          headers: {
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+          },
+        ),
+      );
+      return response.data ?? {'success': false, 'message': 'Empty response'};
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      if (e.response?.statusCode == 401) {
+        return {'success': false, 'message': 'Unable to load dashboard. Please try again.'};
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getGuestProfile() async {
+    try {
+      final response = await _dio.get('/guests/profile');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> updateGuestProfile(Map<String, dynamic> data) async {
+    try {
+      final response = await _dio.put('/guests/profile', data: data);
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> guestChangePassword(String currentPassword, String newPassword, String confirmPassword) async {
+    try {
+      final response = await _dio.post('/guests/change-password', data: {
+        'current_password': currentPassword,
+        'new_password': newPassword,
+        'confirm_password': confirmPassword,
+      });
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ PUBLIC ENDPOINTS ============
+
+  Future<Map<String, dynamic>> getPublicPGs({String? search, String? status, double? minRent, double? maxRent}) async {
+    try {
+      final queryParams = <String, dynamic>{};
+      if (search != null && search.isNotEmpty) queryParams['search'] = search;
+      if (status != null && status.isNotEmpty) queryParams['status'] = status;
+      if (minRent != null) queryParams['min_rent'] = minRent;
+      if (maxRent != null) queryParams['max_rent'] = maxRent;
+
+      final response = await _dio.get(
+        '/public/pgs',
+        queryParameters: queryParams,
+        options: Options(
+          headers: {
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+          },
+        ),
+      );
+      return response.data ?? {'success': false, 'message': 'Empty response', 'data': []};
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      if (e.response?.statusCode == 304) {
+        return {'success': true, 'data': [], 'message': 'Cached - no new data'};
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.', 'data': []};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.', 'data': []};
+    }
+  }
+
+  Future<Map<String, dynamic>> getPublicPGDetails(int pgId) async {
+    try {
+      final response = await _dio.get('/public/pgs/$pgId');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getPublicPGStats() async {
+    try {
+      final response = await _dio.get('/public/pgs/stats');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ TENANT PAYMENTS ============
+  Future<Map<String, dynamic>> generatePaymentQR({
+    String scope = 'bill',
+    int? billId,
+    required double amount,
+  }) async {
+    try {
+      final payload = <String, dynamic>{
+        'scope': scope,
+        'amount': amount,
+      };
+      if (billId != null) payload['bill_id'] = billId;
+      final response = await _dio.post('/tenant-payments/payment-qr', data: payload);
+      return Map<String, dynamic>.from(response.data);
+    } on DioException catch (e) {
+      if (e.response?.data != null) return Map<String, dynamic>.from(e.response!.data);
+      return {'success': false, 'message': 'Unable to generate payment QR'};
+    } catch (e) {
+      return {'success': false, 'message': e.toString()};
+    }
+  }
+
+  // Backward-compatible wrapper.
+  Future<Map<String, dynamic>> generatePartialPaymentQR({
+    required int billId,
+    required double amount,
+  }) {
+    return generatePaymentQR(scope: 'bill', billId: billId, amount: amount);
+  }
+
+
+  Future<Map<String, dynamic>> getCurrentBill() async {
+    try {
+      final response = await _dio.get('/tenant-payments/bill');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getPaymentHistory() async {
+    try {
+      final response = await _dio.get('/tenant-payments/history');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> submitPaymentProof({
+    required int billId,
+    required String transactionId,
+    required double amountPaid,
+    required String paymentScreenshot,
+    String paymentScope = 'bill',
+    int? paymentTargetBillId,
+  }) async {
+    try {
+      if (paymentScope == 'bill' && billId <= 0) {
+        return {'success': false, 'message': 'Invalid bill ID'};
+      }
+      if (paymentScope == 'outstanding' && billId < 0) {
+        return {'success': false, 'message': 'Invalid payment scope'};
+      }
+      if (transactionId.isEmpty) {
+        return {'success': false, 'message': 'Transaction ID is required'};
+      }
+      if (amountPaid <= 0) {
+        return {'success': false, 'message': 'Amount must be greater than 0'};
+      }
+      if (paymentScreenshot.isEmpty) {
+        return {'success': false, 'message': 'Payment screenshot is required'};
+      }
+
+      final formData = FormData();
+      if (billId > 0) {
+        formData.fields.add(MapEntry('bill_id', billId.toString()));
+      }
+      formData.fields.add(MapEntry('payment_scope', paymentScope));
+      if (paymentTargetBillId != null) {
+        formData.fields.add(MapEntry('payment_target_bill_id', paymentTargetBillId.toString()));
+      }
+      formData.fields.add(MapEntry('transaction_id', transactionId));
+      formData.fields.add(MapEntry('amount_paid', amountPaid.toString()));
+
+      try {
+        MultipartFile file;
+        
+        if (kIsWeb) {
+          if (paymentScreenshot.startsWith('data:image')) {
+            final parts = paymentScreenshot.split(',');
+            if (parts.length == 2) {
+              final bytes = base64Decode(parts[1]);
+              if (bytes.isNotEmpty) {
+                file = MultipartFile.fromBytes(
+                  bytes,
+                  filename: 'proof_${DateTime.now().millisecondsSinceEpoch}.jpg',
+                  contentType: DioMediaType('image', 'jpeg'),
+                );
+              } else {
+                return {'success': false, 'message': 'Empty image data'};
+              }
+            } else {
+              return {'success': false, 'message': 'Invalid image data format'};
+            }
+          } else {
+            try {
+              final response = await Dio().get(
+                paymentScreenshot,
+                options: Options(responseType: ResponseType.bytes),
+              );
+              if (response.data != null && response.data is Uint8List) {
+                file = MultipartFile.fromBytes(
+                  response.data as Uint8List,
+                  filename: 'proof_${DateTime.now().millisecondsSinceEpoch}.jpg',
+                  contentType: DioMediaType('image', 'jpeg'),
+                );
+              } else {
+                return {'success': false, 'message': 'Failed to load image'};
+              }
+            } catch (e) {
+              return {'success': false, 'message': 'Failed to load image: ${e.toString()}'};
+            }
+          }
+        } else {
+          final fileObj = File(paymentScreenshot);
+          if (await fileObj.exists()) {
+            final bytes = await fileObj.readAsBytes();
+            if (bytes.isEmpty) {
+              return {'success': false, 'message': 'File is empty'};
+            }
+            
+            String extension = 'jpg';
+            final fileName = fileObj.path.split('/').last;
+            if (fileName.contains('.')) {
+              extension = fileName.split('.').last;
+            }
+            
+            file = MultipartFile.fromBytes(
+              bytes,
+              filename: 'proof_${DateTime.now().millisecondsSinceEpoch}.$extension',
+            );
+          } else {
+            return {'success': false, 'message': 'File does not exist: $paymentScreenshot'};
+          }
+        }
+
+        formData.files.add(MapEntry('payment_screenshot', file));
+      } catch (fileError) {
+        return {'success': false, 'message': 'Failed to process file: ${fileError.toString()}'};
+      }
+
+      final response = await _dio.post(
+        '/tenant-payments/proof',
+        data: formData,
+        options: Options(
+          headers: {
+            'Content-Type': 'multipart/form-data',
+          },
+        ),
+      );
+      
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      if (e.type == DioExceptionType.connectionTimeout ||
+          e.type == DioExceptionType.receiveTimeout) {
+        return {'success': false, 'message': 'The connection is slow right now. Please try again.'};
+      }
+      if (e.type == DioExceptionType.connectionError) {
+        return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ MAINTENANCE ============
+
+  Future<Map<String, dynamic>> getMyMaintenanceRequests({String? status}) async {
+    try {
+      final query = status != null ? '?status=$status' : '';
+      final response = await _dio.get('/maintenance/my-requests$query');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getMaintenanceStats() async {
+    try {
+      final response = await _dio.get('/maintenance/my-stats');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> createMaintenanceRequest({
+    required String issueType,
+    String? description,
+    required String serviceDate,
+    String? freeTime,
+    String? imagePath,
+  }) async {
+    try {
+      final formData = FormData();
+      
+      formData.fields.add(MapEntry('issue_type', issueType));
+      if (description != null && description.isNotEmpty) {
+        formData.fields.add(MapEntry('description', description));
+      }
+      formData.fields.add(MapEntry('service_date', serviceDate));
+      if (freeTime != null && freeTime.isNotEmpty) {
+        formData.fields.add(MapEntry('free_time', freeTime));
+      }
+
+      if (imagePath != null && imagePath.isNotEmpty) {
+        try {
+          MultipartFile file;
+          
+          if (kIsWeb) {
+            if (imagePath.startsWith('data:image')) {
+              final parts = imagePath.split(',');
+              if (parts.length == 2) {
+                final bytes = base64Decode(parts[1]);
+                if (bytes.isNotEmpty) {
+                  file = MultipartFile.fromBytes(
+                    bytes,
+                    filename: 'maintenance_${DateTime.now().millisecondsSinceEpoch}.jpg',
+                    contentType: DioMediaType('image', 'jpeg'),
+                  );
+                } else {
+                  return {'success': false, 'message': 'Empty image data'};
+                }
+              } else {
+                return {'success': false, 'message': 'Invalid image data format'};
+              }
+            } else {
+              try {
+                final response = await Dio().get(
+                  imagePath,
+                  options: Options(responseType: ResponseType.bytes),
+                );
+                if (response.data != null && response.data is Uint8List) {
+                  file = MultipartFile.fromBytes(
+                    response.data as Uint8List,
+                    filename: 'maintenance_${DateTime.now().millisecondsSinceEpoch}.jpg',
+                    contentType: DioMediaType('image', 'jpeg'),
+                  );
+                } else {
+                  return {'success': false, 'message': 'Failed to load image'};
+                }
+              } catch (e) {
+                return {'success': false, 'message': 'Failed to load image: ${e.toString()}'};
+              }
+            }
+          } else {
+            final fileObj = File(imagePath);
+            if (await fileObj.exists()) {
+              final bytes = await fileObj.readAsBytes();
+              if (bytes.isEmpty) {
+                return {'success': false, 'message': 'File is empty'};
+              }
+              file = MultipartFile.fromBytes(
+                bytes,
+                filename: 'maintenance_${DateTime.now().millisecondsSinceEpoch}.jpg',
+              );
+            } else {
+              return {'success': false, 'message': 'File does not exist: $imagePath'};
+            }
+          }
+
+          formData.files.add(MapEntry('image', file));
+        } catch (fileError) {
+          return {'success': false, 'message': 'Failed to process file: ${fileError.toString()}'};
+        }
+      }
+
+      final response = await _dio.post(
+        '/maintenance/request',
+        data: formData,
+        options: Options(
+          headers: {
+            'Content-Type': 'multipart/form-data',
+          },
+        ),
+      );
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ DOCUMENTS ============
+
+  Future<Map<String, dynamic>> getDocumentTypes() async {
+    try {
+      final response = await _dio.get('/documents/types');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getMyDocuments() async {
+    try {
+      final response = await _dio.get('/documents/my-documents');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ VEHICLE ============
+
+  Future<Map<String, dynamic>> getMyVehicle() async {
+    try {
+      final response = await _dio.get('/documents/vehicle');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> updateMyVehicle({
+    bool? hasVehicle,
+    String? vehicleNumber,
+  }) async {
+    try {
+      final body = <String, dynamic>{};
+      if (hasVehicle != null) body['has_vehicle'] = hasVehicle;
+      if (vehicleNumber != null) body['vehicle_number'] = vehicleNumber;
+      final response = await _dio.put('/documents/vehicle', data: body);
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> uploadDocument({
+    required String documentType,
+    required String filePath,
+  }) async {
+    try {
+      if (documentType.isEmpty) {
+        return {'success': false, 'message': 'Document type is required'};
+      }
+      if (filePath.isEmpty) {
+        return {'success': false, 'message': 'File path is required'};
+      }
+
+      final formData = FormData();
+      formData.fields.add(MapEntry('document_type', documentType));
+
+      try {
+        MultipartFile file;
+        
+        if (kIsWeb) {
+          if (filePath.startsWith('data:image')) {
+            final parts = filePath.split(',');
+            if (parts.length == 2) {
+              final bytes = base64Decode(parts[1]);
+              if (bytes.isNotEmpty) {
+                file = MultipartFile.fromBytes(
+                  bytes,
+                  filename: 'doc_${DateTime.now().millisecondsSinceEpoch}.jpg',
+                  contentType: DioMediaType('image', 'jpeg'),
+                );
+              } else {
+                return {'success': false, 'message': 'Empty image data'};
+              }
+            } else {
+              return {'success': false, 'message': 'Invalid image data format'};
+            }
+          } else if (filePath.startsWith('http')) {
+            try {
+              final response = await Dio().get(
+                filePath,
+                options: Options(responseType: ResponseType.bytes),
+              );
+              if (response.data != null && response.data is Uint8List) {
+                file = MultipartFile.fromBytes(
+                  response.data as Uint8List,
+                  filename: 'doc_${DateTime.now().millisecondsSinceEpoch}.jpg',
+                  contentType: DioMediaType('image', 'jpeg'),
+                );
+              } else {
+                return {'success': false, 'message': 'Failed to download file'};
+              }
+            } catch (e) {
+              return {'success': false, 'message': 'Failed to download file: ${e.toString()}'};
+            }
+          } else {
+            return {'success': false, 'message': 'Invalid file path format'};
+          }
+        } else {
+          final fileObj = File(filePath);
+          if (await fileObj.exists()) {
+            final bytes = await fileObj.readAsBytes();
+            if (bytes.isEmpty) {
+              return {'success': false, 'message': 'File is empty'};
+            }
+            
+            String extension = 'jpg';
+            final fileName = fileObj.path.split('/').last;
+            if (fileName.contains('.')) {
+              extension = fileName.split('.').last;
+            }
+            
+            file = MultipartFile.fromBytes(
+              bytes,
+              filename: 'doc_${DateTime.now().millisecondsSinceEpoch}.$extension',
+            );
+          } else {
+            return {'success': false, 'message': 'File does not exist: $filePath'};
+          }
+        }
+
+        formData.files.add(MapEntry('document', file));
+      } catch (fileError) {
+        return {'success': false, 'message': 'Failed to process file: ${fileError.toString()}'};
+      }
+
+      final response = await _dio.post(
+        '/documents/upload',
+        data: formData,
+        options: Options(
+          headers: {
+            'Content-Type': 'multipart/form-data',
+          },
+        ),
+      );
+      
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        if (e.response!.data is Map && (e.response!.data as Map).containsKey('message')) {
+          return e.response!.data;
+        }
+      }
+      if (e.type == DioExceptionType.connectionTimeout ||
+          e.type == DioExceptionType.receiveTimeout) {
+        return {'success': false, 'message': 'The connection is slow right now. Please try again.'};
+      }
+      if (e.type == DioExceptionType.connectionError) {
+        return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+      }
+      if (e.type == DioExceptionType.badResponse) {
+        final statusCode = e.response?.statusCode;
+        if (statusCode == 400) {
+          return {'success': false, 'message': 'Invalid document type or file format.'};
+        }
+        if (statusCode == 401) {
+          return {'success': false, 'message': 'We could not verify this request. Please try again.'};
+        }
+        if (statusCode == 403) {
+          return {'success': false, 'message': 'You do not have permission to download this document.'};
+        }
+        if (statusCode == 413) {
+          return {'success': false, 'message': 'File too large. Please use a smaller image.'};
+        }
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+
+  /// Dedicated download for the authenticated tenant's own document.
+  /// Calls GET /documents/:documentId/download and returns the file URL
+  /// (backend redirects to the stored document URL after ownership check).
+  Future<Map<String, dynamic>> downloadMyDocument(dynamic documentId) async {
+    try {
+      final response = await _dio.get(
+        '/documents/$documentId/download',
+        options: Options(
+          followRedirects: false,
+          validateStatus: (status) =>
+              status != null && status >= 200 && status < 400,
+        ),
+      );
+
+      // Express res.redirect -> 302 with Location header
+      final location = response.headers.value('location');
+      if (location != null && location.isNotEmpty) {
+        return {'success': true, 'url': location};
+      }
+
+      // Fallback if body contains url
+      if (response.data is Map) {
+        final data = Map<String, dynamic>.from(response.data as Map);
+        if (data['url'] != null) {
+          return {'success': true, 'url': data['url']};
+        }
+        return data;
+      }
+
+      return {'success': false, 'message': 'Download URL not available'};
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        if (e.response!.data is Map) {
+          return Map<String, dynamic>.from(e.response!.data as Map);
+        }
+      }
+      final status = e.response?.statusCode;
+      if (status == 403) {
+        return {
+          'success': false,
+          'message': 'Unauthorized: You can only download your own documents'
+        };
+      }
+      if (status == 404) {
+        return {'success': false, 'message': 'Document not found'};
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Something went wrong. Please try again.'
+      };
+    }
+  }
+
+  /// Bulk download the authenticated tenant's documents as a ZIP.
+  /// Pass [documentIds] to download a subset; omit/empty for all uploaded docs.
+  /// Returns { success, bytes (Uint8List), filename } or error map.
+  Future<Map<String, dynamic>> downloadMyDocumentsBulk({
+    List<dynamic>? documentIds,
+  }) async {
+    try {
+      final response = await _dio.post(
+        '/documents/my-documents/download',
+        data: {
+          if (documentIds != null && documentIds.isNotEmpty)
+            'documentIds': documentIds,
+        },
+        options: Options(
+          responseType: ResponseType.bytes,
+          followRedirects: false,
+          validateStatus: (status) =>
+              status != null && status >= 200 && status < 400,
+        ),
+      );
+
+      final bytes = response.data;
+      if (bytes is! List<int> && bytes is! Uint8List) {
+        return {'success': false, 'message': 'Invalid zip response from server'};
+      }
+      final list = bytes is Uint8List ? bytes : Uint8List.fromList(bytes as List<int>);
+      final disposition = response.headers.value('content-disposition') ?? '';
+      String filename = 'my_documents.zip';
+      final match = RegExp(r'filename="?([^";]+)"?').firstMatch(disposition);
+      if (match != null) filename = match.group(1) ?? filename;
+
+      return {
+        'success': true,
+        'bytes': list,
+        'filename': filename,
+      };
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        // When responseType is bytes, error body may still be bytes
+        try {
+          if (e.response!.data is Map) {
+            return Map<String, dynamic>.from(e.response!.data as Map);
+          }
+          if (e.response!.data is List<int>) {
+            final decoded = utf8.decode(e.response!.data as List<int>);
+            final map = jsonDecode(decoded);
+            if (map is Map) return Map<String, dynamic>.from(map);
+          }
+        } catch (_) {}
+      }
+      final status = e.response?.statusCode;
+      if (status == 403) {
+        return {
+          'success': false,
+          'message': 'Unauthorized: You can only download your own documents'
+        };
+      }
+      if (status == 400) {
+        return {'success': false, 'message': 'No documents available to download'};
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {
+        'success': false,
+        'message': 'Something went wrong. Please try again.'
+      };
+    }
+  }
+
+  // ============ NOTIFICATIONS ============
+
+  Future<Map<String, dynamic>> getTenantNotifications({int limit = 50, int offset = 0}) async {
+    try {
+      final response = await _dio.get('/tenant-notifications?limit=$limit&offset=$offset');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getUnreadTenantNotifications({int limit = 20}) async {
+    try {
+      final response = await _dio.get('/tenant-notifications/unread?limit=$limit');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getUnreadTenantCount() async {
+    try {
+      final response = await _dio.get('/tenant-notifications/unread/count');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> markTenantNotificationRead(int notificationId) async {
+    try {
+      final response = await _dio.put('/tenant-notifications/$notificationId/read');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> markAllTenantNotificationsRead() async {
+    try {
+      final response = await _dio.put('/tenant-notifications/read-all');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getGuestNotifications({int limit = 50, int offset = 0}) async {
+    try {
+      final response = await _dio.get('/guest-notifications?limit=$limit&offset=$offset');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getUnreadGuestNotifications({int limit = 20}) async {
+    try {
+      final response = await _dio.get('/guest-notifications/unread?limit=$limit');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getUnreadGuestCount() async {
+    try {
+      final response = await _dio.get('/guest-notifications/unread/count');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> markGuestNotificationRead(int notificationId) async {
+    try {
+      final response = await _dio.put('/guest-notifications/$notificationId/read');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> markAllGuestNotificationsRead() async {
+    try {
+      final response = await _dio.put('/guest-notifications/read-all');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============================================================
+  // FIXED: these were missing entirely — deleteNotification() in
+  // NotificationService had no backend call to make, so a "deleted"
+  // notification just came back on the next refresh.
+  // ============================================================
+  Future<Map<String, dynamic>> deleteTenantNotification(int notificationId) async {
+    try {
+      final response = await _dio.delete('/tenant-notifications/$notificationId');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> deleteGuestNotification(int notificationId) async {
+    try {
+      final response = await _dio.delete('/guest-notifications/$notificationId');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ FEEDBACK ============
+
+  Future<Map<String, dynamic>> submitFeedback(Map<String, dynamic> data) async {
+    try {
+      final response = await _dio.post('/feedbacks/submit', data: data);
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getMyFeedback() async {
+    try {
+      final response = await _dio.get('/feedbacks/my-feedback');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> checkFeedbackStatus() async {
+    try {
+      final response = await _dio.get('/feedbacks/status');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ GUEST FEEDBACK (Mobile App) ============
+
+  Future<Map<String, dynamic>> submitGuestFeedback(Map<String, dynamic> data) async {
+    try {
+      final response = await _dio.post('/feedbacks/guest/submit', data: data);
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> checkGuestFeedbackStatus() async {
+    try {
+      final response = await _dio.get('/feedbacks/guest/status');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getMyGuestFeedback() async {
+    try {
+      final response = await _dio.get('/feedbacks/guest/my-feedback');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============ PUBLIC FEEDBACK (Website - No Auth) ============
+
+  Future<Map<String, dynamic>> submitPublicFeedback(Map<String, dynamic> data) async {
+    try {
+      final response = await _dio.post('/feedbacks/public/submit', data: data);
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============================================================
+  // NEW: Tenant completes maintenance request
+  // ============================================================
+  Future<Map<String, dynamic>> completeMaintenanceByTenant(int requestId) async {
+    try {
+      final response = await _dio.put('/maintenance/$requestId/complete-by-tenant');
+      return response.data;
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null) {
+        return e.response!.data;
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  // ============================================================
+  // FCM TOKEN ENDPOINTS (Add to ApiService class)
+  // ============================================================
+
+  /// Update FCM token on backend (role-aware).
+  /// Tenants → /tenants/device/fcm-token
+  /// Guests  → /guests/device/fcm-token
+  /// Failures here must never log the user out (interceptor protects this).
+  Future<Map<String, dynamic>> updateFCMToken(String token, {String? appVersion}) async {
+    try {
+      final role = _role ??
+          (await SharedPreferences.getInstance()).getString(kStorageRole);
+      final path = (role == 'guest')
+          ? '/guests/device/fcm-token'
+          : '/tenants/device/fcm-token';
+      final response = await _dio.post(path, data: {
+        'fcm_token': token,
+        'device_type': Platform.isIOS ? 'ios' : 'android',
+        if (appVersion != null) 'app_version': appVersion,
+      });
+      return response.data is Map
+          ? Map<String, dynamic>.from(response.data as Map)
+          : {'success': true};
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null && e.response!.data is Map) {
+        return Map<String, dynamic>.from(e.response!.data as Map);
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  /// Remove FCM token on logout (role-aware).
+  Future<Map<String, dynamic>> removeFCMToken({String? token}) async {
+    try {
+      final role = _role ??
+          (await SharedPreferences.getInstance()).getString(kStorageRole);
+      final path = (role == 'guest')
+          ? '/guests/device/fcm-token'
+          : '/tenants/device/fcm-token';
+      final data = token != null ? {'fcm_token': token} : {};
+      final response = await _dio.delete(path, data: data);
+      return response.data is Map
+          ? Map<String, dynamic>.from(response.data as Map)
+          : {'success': true};
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data != null && e.response!.data is Map) {
+        return Map<String, dynamic>.from(e.response!.data as Map);
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+}

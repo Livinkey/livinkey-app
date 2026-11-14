@@ -1,0 +1,654 @@
+import '../../services/session_manager.dart';
+import 'dart:ui';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import '../../utils/constants.dart';
+import '../../utils/helpers.dart';
+import '../../services/notification_service.dart';
+import '../../services/api_service.dart';
+import '../../services/push_notification_service.dart';
+import 'guest_home_screen.dart';
+import 'guest_search_screen.dart';
+import 'guest_profile_screen.dart';
+import '../common/notification_screen.dart';
+import '../../widgets/guest/guest_drawer.dart';
+import '../auth/login_screen.dart';
+import '../tenant/tenant_screen.dart';
+import '../../widgets/common/snackbar_helper.dart';
+
+class GuestScreen extends StatefulWidget {
+  /// True when a logged-in tenant opened guest mode (drawer / profile / quick action).
+  /// Passed explicitly so back-button and UI work immediately (no async race).
+  final bool isTenantGuest;
+
+  const GuestScreen({super.key, this.isTenantGuest = false});
+
+  /// Single entry point for "Enter as Guest" from tenant UI.
+  /// Uses a named route so repeated enters cannot stack broken guest screens.
+  static Future<void> openAsTenantGuest(BuildContext context) {
+    return Navigator.of(context).push(
+      MaterialPageRoute(
+        settings: const RouteSettings(name: '/guest-mode'),
+        builder: (_) => const GuestScreen(isTenantGuest: true),
+      ),
+    );
+  }
+
+  @override
+  State<GuestScreen> createState() => GuestScreenState();
+}
+
+class GuestScreenState extends State<GuestScreen> {
+  int _selectedIndex = 0;
+  late final PageController _pageController;
+  final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
+  final NotificationService _notificationService = NotificationService();
+  final ApiService _api = ApiService();
+  int _unreadCount = 0;
+  late bool _isTenantViewingAsGuest;
+
+  static const List<Widget> _screens = [
+    GuestHomeScreen(),
+    GuestSearchScreen(),
+    GuestProfileScreen(),
+  ];
+
+  @override
+  void initState() {
+    super.initState();
+    // Synchronous: trust the navigation flag immediately so back / FAB are correct
+    // on the first frame (fixes multi switch + wrong back dialog).
+    _isTenantViewingAsGuest = widget.isTenantGuest;
+    _pageController = PageController(initialPage: 0);
+    _notificationService.initialize(isTenant: false);
+    _updateUnreadCount();
+    _checkIfTenantViewingAsGuest();
+
+    _notificationService.notificationsStream.listen((_) {
+      if (mounted) {
+        _updateUnreadCount();
+      }
+    });
+  }
+
+  Future<void> _checkIfTenantViewingAsGuest() async {
+    try {
+      // Role stays as tenant when they enter guest mode (no token switch)
+      final role = await _api.getStoredRole();
+      if (mounted) {
+        setState(() {
+          _isTenantViewingAsGuest = widget.isTenantGuest || role == 'tenant';
+        });
+      }
+    } catch (_) {
+      // Keep widget.isTenantGuest value
+    }
+  }
+
+  void _returnToTenant() {
+    HapticFeedback.mediumImpact();
+    // Capture messenger before popping (this route may dispose).
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    final nav = Navigator.of(context);
+    if (nav.canPop()) {
+      // Pop every guest-mode route so multiple "Enter as Guest" pushes
+      // always land back on the tenant dashboard, not another guest layer.
+      nav.popUntil((route) => route.settings.name != '/guest-mode');
+    } else {
+      nav.pushReplacement(
+        MaterialPageRoute(builder: (_) => const TenantScreen()),
+      );
+    }
+    messenger?.showSnackBar(
+      const SnackBar(
+        content: Text('Welcome back to your tenant dashboard'),
+        behavior: SnackBarBehavior.floating,
+        duration: Duration(seconds: 2),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  void _updateUnreadCount() {
+    setState(() {
+      _unreadCount = _notificationService.unreadCount;
+    });
+  }
+
+  void navigateToTab(int index) {
+    if (_selectedIndex != index) {
+      _pageController.jumpToPage(index);
+    }
+    HapticFeedback.lightImpact();
+  }
+
+  void openDrawer() {
+    _scaffoldKey.currentState?.openDrawer();
+  }
+
+  IconData _getIcon(int index) {
+    const icons = [
+      Icons.home_rounded,
+      Icons.search_rounded,
+      Icons.person_rounded,
+    ];
+    return icons[index];
+  }
+
+  String _getLabel(int index) {
+    const labels = ['Home', 'Search', 'Profile'];
+    return labels[index];
+  }
+
+  void _showQuickActions() {
+    showModalBottomSheet(
+      context: context,
+      backgroundColor: kLivinkeyBlack,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      builder: (context) => Container(
+        padding: const EdgeInsets.all(24),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 40,
+              height: 4,
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.2),
+                borderRadius: BorderRadius.circular(2),
+              ),
+            ),
+            const SizedBox(height: 24),
+            const Text(
+              'Quick Actions',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            const SizedBox(height: 16),
+            // ============================================================
+            // FIXED: Removed "Switch to Tenant" - Guests should NOT see this
+            // ============================================================
+            _buildQuickActionItem(
+              icon: Icons.logout_rounded,
+              color: Colors.red,
+              label: 'Logout',
+              onTap: () {
+                Navigator.pop(context);
+                _handleLogout();
+              },
+            ),
+            const SizedBox(height: 20),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildQuickActionItem({
+    required IconData icon,
+    required Color color,
+    required String label,
+    required VoidCallback onTap,
+  }) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        padding: const EdgeInsets.all(16),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              color.withOpacity(0.1),
+              Colors.transparent,
+            ],
+          ),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: color.withOpacity(0.2),
+            width: 1,
+          ),
+        ),
+        child: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              decoration: BoxDecoration(
+                color: color.withOpacity(0.15),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(icon, color: color, size: 22),
+            ),
+            const SizedBox(width: 14),
+            Expanded(
+              child: Text(
+                label,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 15,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+            ),
+            Icon(
+              Icons.arrow_forward_ios_rounded,
+              color: Colors.white.withOpacity(0.2),
+              size: 16,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _handleLogout() {
+    showDialog(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF161616),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(20),
+          side: BorderSide(color: Colors.white.withOpacity(0.08), width: 1),
+        ),
+        title: Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(
+                color: Colors.red.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: const Icon(Icons.logout_rounded, color: Colors.red, size: 18),
+            ),
+            const SizedBox(width: 12),
+            const Text(
+              'Logout',
+              style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700),
+            ),
+          ],
+        ),
+        content: Text(
+          'Are you sure you want to logout?',
+          style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 14),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context),
+            child: Text(
+              'Cancel',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.5),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+          TextButton(
+            onPressed: () async {
+              Navigator.pop(context);
+              await SessionManager().logout();
+            },
+            child: const Text(
+              'Logout',
+              style: TextStyle(color: Colors.red, fontWeight: FontWeight.w700),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFloatingTab({
+    required IconData icon,
+    required String label,
+    required bool isSelected,
+    required VoidCallback onTap,
+    required VoidCallback? onLongPress,
+  }) {
+    return Expanded(
+      child: GestureDetector(
+        onTap: onTap,
+        onLongPress: label == 'Profile' ? onLongPress : null,
+        behavior: HitTestBehavior.opaque,
+        child: Container(
+          padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 4),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              AnimatedSwitcher(
+                duration: const Duration(milliseconds: 250),
+                transitionBuilder: (child, anim) => ScaleTransition(
+                  scale: anim,
+                  child: FadeTransition(opacity: anim, child: child),
+                ),
+                child: Icon(
+                  icon,
+                  key: ValueKey('$icon-$isSelected'),
+                  color: isSelected ? kLivinkeyGreen : Colors.white.withOpacity(0.38),
+                  size: isSelected ? 26 : 22,
+                ),
+              ),
+              const SizedBox(height: 4),
+              AnimatedDefaultTextStyle(
+                duration: const Duration(milliseconds: 300),
+                style: TextStyle(
+                  color: isSelected ? kLivinkeyGreen : Colors.white.withOpacity(0.38),
+                  fontSize: isSelected ? 11 : 10,
+                  fontWeight: isSelected ? FontWeight.w700 : FontWeight.w500,
+                  letterSpacing: 0.2,
+                ),
+                child: Text(label),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return WillPopScope(
+      onWillPop: () async {
+        // On a non-home tab: go back to Home (previous section), do not exit.
+        if (_selectedIndex != 0) {
+          setState(() => _selectedIndex = 0);
+          _pageController.jumpToPage(0);
+          return false;
+        }
+        // Tenant viewing as guest → return to tenant dashboard with message
+        if (_isTenantViewingAsGuest) {
+          final shouldReturn = await showDialog<bool>(
+            context: context,
+            builder: (context) => AlertDialog(
+              backgroundColor: const Color(0xFF161616),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(20),
+                side: BorderSide(color: Colors.white.withOpacity(0.08), width: 1),
+              ),
+              title: const Text(
+                'Return to Tenant Dashboard?',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 20,
+                  fontWeight: FontWeight.w700,
+                ),
+              ),
+              content: Text(
+                'You are browsing as a guest. Do you want to go back to your tenant dashboard?',
+                style: TextStyle(
+                  color: Colors.white.withOpacity(0.6),
+                  fontSize: 14,
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(false),
+                  child: Text(
+                    'Stay',
+                    style: TextStyle(
+                      color: Colors.white.withOpacity(0.5),
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(true),
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                    decoration: BoxDecoration(
+                      gradient: const LinearGradient(
+                        colors: [kLivinkeyGreen, Color(0xFF7CB342)],
+                      ),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: const Text(
+                      'Return',
+                      style: TextStyle(
+                        color: Colors.black,
+                        fontWeight: FontWeight.w700,
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          );
+          if (shouldReturn == true) {
+            _returnToTenant();
+          }
+          return false; // We handled navigation ourselves
+        }
+        // Pure guest — confirm exiting the app
+        return await showDialog(
+          context: context,
+          builder: (context) => AlertDialog(
+            backgroundColor: const Color(0xFF161616),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(20),
+              side: BorderSide(color: Colors.white.withOpacity(0.08), width: 1),
+            ),
+            title: const Text(
+              'Exit App?',
+              style: TextStyle(
+                color: Colors.white,
+                fontSize: 20,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+            content: Text(
+              'Are you sure you want to exit the app?',
+              style: TextStyle(
+                color: Colors.white.withOpacity(0.6),
+                fontSize: 14,
+              ),
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(false),
+                child: Text(
+                  'Cancel',
+                  style: TextStyle(
+                    color: Colors.white.withOpacity(0.5),
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(context).pop(true),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
+                  decoration: BoxDecoration(
+                    gradient: const LinearGradient(
+                      colors: [kLivinkeyGreen, Color(0xFF7CB342)],
+                    ),
+                    borderRadius: BorderRadius.circular(8),
+                  ),
+                  child: const Text(
+                    'Exit',
+                    style: TextStyle(
+                      color: Colors.black,
+                      fontWeight: FontWeight.w700,
+                    ),
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ) ?? false;
+      },
+      child: Scaffold(
+        key: _scaffoldKey,
+        backgroundColor: kLivinkeyBlack,
+        drawer: GuestDrawer(
+        selectedIndex: _selectedIndex,
+        isTenantGuest: _isTenantViewingAsGuest,
+        onReturnToTenant: _returnToTenant,
+        onNavigateToTab: navigateToTab,
+      ),
+        extendBody: true,
+        body: Stack(
+          children: [
+            Positioned(
+              top: -120,
+              right: -80,
+              child: Container(
+                width: 260,
+                height: 260,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: RadialGradient(
+                    colors: [
+                      kLivinkeyGreen.withOpacity(0.16),
+                      kLivinkeyGreen.withOpacity(0.0),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            Positioned(
+              bottom: -140,
+              left: -100,
+              child: Container(
+                width: 280,
+                height: 280,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  gradient: RadialGradient(
+                    colors: [
+                      kLivinkeyGreen.withOpacity(0.10),
+                      kLivinkeyGreen.withOpacity(0.0),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+            PageView(
+              controller: _pageController,
+              physics: const BouncingScrollPhysics(
+                parent: AlwaysScrollableScrollPhysics(),
+              ),
+              onPageChanged: (index) {
+                setState(() {
+                  _selectedIndex = index;
+                });
+                if (index == 2) {
+                  _updateUnreadCount();
+                }
+              },
+              children: _screens,
+            ),
+            // ============================================================
+            // Return-to-Tenant floating control (only for tenants visiting as guest)
+            // Positioned so it does not interfere with the 3 main tabs
+            // ============================================================
+            if (_isTenantViewingAsGuest)
+              Positioned(
+                right: 20,
+                bottom: 100 + MediaQuery.of(context).padding.bottom,
+                child: Material(
+                  color: Colors.transparent,
+                  elevation: 8,
+                  borderRadius: BorderRadius.circular(28),
+                  child: InkWell(
+                    onTap: _returnToTenant,
+                    borderRadius: BorderRadius.circular(28),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(
+                          colors: [Color(0xFFFF9800), Color(0xFFF57C00)],
+                        ),
+                        borderRadius: BorderRadius.circular(28),
+                        boxShadow: [
+                          BoxShadow(
+                            color: const Color(0xFFFF9800).withOpacity(0.45),
+                            blurRadius: 16,
+                            offset: const Offset(0, 6),
+                          ),
+                        ],
+                        border: Border.all(
+                          color: Colors.white.withOpacity(0.2),
+                          width: 1,
+                        ),
+                      ),
+                      child: const Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(Icons.home_work_rounded, color: Colors.white, size: 20),
+                          SizedBox(width: 8),
+                          Text(
+                            'Back to Tenant',
+                            style: TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w700,
+                              letterSpacing: 0.2,
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+        bottomNavigationBar: Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(30),
+            child: BackdropFilter(
+              filter: ImageFilter.blur(sigmaX: 18, sigmaY: 18),
+              child: Container(
+                padding: const EdgeInsets.all(6),
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.07),
+                  borderRadius: BorderRadius.circular(30),
+                  border: Border.all(
+                    color: Colors.white.withOpacity(0.10),
+                    width: 1.2,
+                  ),
+                  boxShadow: [
+                    BoxShadow(
+                      color: Colors.black.withOpacity(0.45),
+                      blurRadius: 30,
+                      offset: const Offset(0, -6),
+                    ),
+                    BoxShadow(
+                      color: kLivinkeyGreen.withOpacity(0.12),
+                      blurRadius: 32,
+                      offset: const Offset(0, -2),
+                    ),
+                  ],
+                ),
+                child: Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                  children: List.generate(_screens.length, (index) {
+                    final isSelected = _selectedIndex == index;
+                    return _buildFloatingTab(
+                      icon: _getIcon(index),
+                      label: _getLabel(index),
+                      isSelected: isSelected,
+                      onTap: () => navigateToTab(index),
+                      onLongPress: index == 2 ? _showQuickActions : null,
+                    );
+                  }),
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}

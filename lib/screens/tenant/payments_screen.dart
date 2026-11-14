@@ -1,0 +1,2275 @@
+import 'dart:async';
+import 'dart:io';
+import 'dart:convert';
+import 'package:flutter/foundation.dart';
+import 'package:flutter/material.dart';
+import 'package:font_awesome_flutter/font_awesome_flutter.dart';
+import 'package:url_launcher/url_launcher.dart';
+import 'package:intl/intl.dart';
+import 'package:image_picker/image_picker.dart';
+
+import '../../utils/constants.dart';
+import '../../utils/helpers.dart';
+import '../../services/api_service.dart';
+import '../../services/upi_payment_service.dart';
+import '../../services/notification_service.dart';
+import '../../widgets/tenant/payment_chip.dart';
+import '../../widgets/tenant/bill_breakdown_card.dart';
+import '../../widgets/tenant/upi_app_sheet.dart';
+import '../../services/app_events.dart';
+import '../../widgets/common/snackbar_helper.dart';
+import '../../widgets/common/loading_indicator.dart';
+import '../../models/auth_models.dart';
+import '../../models/bill_model.dart';
+import '../common/notification_screen.dart';
+import 'tenant_screen.dart';
+
+class PaymentsScreen extends StatefulWidget {
+  const PaymentsScreen({super.key});
+
+  @override
+  State<PaymentsScreen> createState() => _PaymentsScreenState();
+}
+
+class _PaymentsScreenState extends State<PaymentsScreen>
+    with AutomaticKeepAliveClientMixin, SingleTickerProviderStateMixin, WidgetsBindingObserver {
+  @override
+  bool get wantKeepAlive => true;
+
+  late AnimationController _fadeController;
+  late Animation<double> _fadeAnimation;
+  late Animation<Offset> _slideAnimation;
+  int _selectedPaymentMethod = 0;
+  bool _isRefreshing = false;
+  bool _isLoading = true;
+
+  final ApiService _api = ApiService();
+
+  BillModel? _currentBill;
+  PaymentHistory? _paymentHistory;
+
+  final TextEditingController _transactionIdController = TextEditingController();
+  final TextEditingController _amountController = TextEditingController();
+  final TextEditingController _partialAmountController = TextEditingController();
+  bool _isSubmittingProof = false;
+  String? _paymentScreenshotPath;
+  String? _partialQrUrl;
+  String? _partialUpiLink;
+  double? _partialAmount;
+  bool _isGeneratingPartialQr = false;
+  String _paymentScope = 'bill';
+  String? _scopedQrUrl;
+  String? _scopedUpiLink;
+  double? _scopedQrAmount;
+  bool _isGeneratingScopedQr = false;
+
+  bool _awaitingUpiReturn = false;
+  Timer? _liveTimer;
+  bool _isDownloadingReceipt = false;
+  int? _downloadingReceiptId;
+
+  @override
+  void initState() {
+    super.initState();
+    _fadeController = AnimationController(
+      duration: kFadeDuration,
+      vsync: this,
+    );
+    _fadeAnimation = Tween<double>(begin: 0.0, end: 1.0).animate(
+      CurvedAnimation(parent: _fadeController, curve: Curves.easeOut),
+    );
+    _slideAnimation = Tween<Offset>(
+      begin: const Offset(0, 0.04),
+      end: Offset.zero,
+    ).animate(
+      CurvedAnimation(parent: _fadeController, curve: Curves.easeOutCubic),
+    );
+    WidgetsBinding.instance.addObserver(this);
+    AppEvents.refreshTick.addListener(_onExternalRefresh);
+    // Quietly check for changes (payment verified, fine added...) while the screen is open.
+    _liveTimer = Timer.periodic(const Duration(seconds: 40), (_) => _silentRefresh());
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _fadeController.forward();
+      _loadPaymentData();
+    });
+  }
+
+  void _onExternalRefresh() => _silentRefresh();
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _awaitingUpiReturn) {
+      _awaitingUpiReturn = false;
+      _loadPaymentData(silent: true);
+      _showAfterPaymentPrompt();
+    }
+  }
+
+  /// Compares the latest bill with what is on screen and reloads only if it changed.
+  Future<void> _silentRefresh() async {
+    if (!mounted || _isLoading || _isSubmittingProof || _isRefreshing) return;
+    try {
+      final r = await _api.getCurrentBill();
+      if (!mounted || r['success'] != true || r['data'] == null) return;
+      final billData = r['data']['bill'];
+      final latest = billData != null ? BillModel.fromJson(billData) : null;
+      final cur = _currentBill;
+      final changed = (latest == null) != (cur == null) ||
+          (latest != null && cur != null &&
+              (latest.id != cur.id ||
+                  latest.status != cur.status ||
+                  (latest.paidAmount - cur.paidAmount).abs() > 0.005 ||
+                  (latest.fineAmount - cur.fineAmount).abs() > 0.005 ||
+                  (latest.totalAmount - cur.totalAmount).abs() > 0.005));
+      if (changed) await _loadPaymentData(silent: true);
+    } catch (_) {}
+  }
+
+  void _showAfterPaymentPrompt() {
+    if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        backgroundColor: const Color(0xFF151515),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+        title: const Text('Did your payment go through?',
+            style: TextStyle(color: Colors.white, fontWeight: FontWeight.w800, fontSize: 18)),
+        content: Text(
+          'If you paid successfully, upload a screenshot or the transaction ID so the property team can verify it quickly. Your bill updates automatically once it is verified.',
+          style: TextStyle(color: Colors.white.withOpacity(0.7), height: 1.4),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text('Not yet'),
+          ),
+          FilledButton(
+            style: FilledButton.styleFrom(backgroundColor: kLivinkeyGreen, foregroundColor: Colors.black),
+            onPressed: () {
+              Navigator.of(ctx).pop();
+              SnackbarHelper.showInfo(context, 'Scroll down to "Submit payment proof" and attach your screenshot.');
+            },
+            child: const Text('Yes, I paid'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    _liveTimer?.cancel();
+    AppEvents.refreshTick.removeListener(_onExternalRefresh);
+    WidgetsBinding.instance.removeObserver(this);
+    _fadeController.dispose();
+    _transactionIdController.dispose();
+    _amountController.dispose();
+    _partialAmountController.dispose();
+    super.dispose();
+  }
+
+  Future<void> _loadPaymentData({bool silent = false}) async {
+    if (!mounted) return;
+    if (!silent) setState(() => _isLoading = true);
+    try {
+      final billResponse = await _api.getCurrentBill();
+      if (billResponse['success'] == true && billResponse['data'] != null) {
+        final billData = billResponse['data']['bill'];
+        _currentBill = billData != null ? BillModel.fromJson(billData) : null;
+          _scopedQrUrl = null;
+          _scopedUpiLink = null;
+          _scopedQrAmount = null;
+          if (_currentBill == null) {
+            _paymentScope = 'bill';
+          } else {
+            final currentDue = _currentBill!.totalAmount + _currentBill!.fineAmount - _currentBill!.paidAmount;
+            _paymentScope = (_currentBill!.totalOutstanding > 0.005 && currentDue <= 0.005)
+                ? 'outstanding'
+                : 'bill';
+          }
+      } else if ((billResponse['message']?.toString().toLowerCase() ?? '') == 'no bill found') {
+        // The backend returns 404 when there is no active bill. Clear any
+        // previously loaded bill so a soft-deleted bill cannot remain on
+        // screen after refresh/reload.
+        _currentBill = null;
+      }
+
+      final historyResponse = await _api.getPaymentHistory();
+      if (historyResponse['success'] && historyResponse['data'] != null) {
+        _paymentHistory = PaymentHistory.fromJson(historyResponse['data']);
+      }
+
+      if (mounted) {
+        await NotificationService().refresh(isTenant: true);
+      }
+    } catch (e) {
+      if (mounted && !silent) {
+        SnackbarHelper.showError(context, "We couldn't load your payments. Pull down to try again.");
+      }
+    } finally {
+      if (mounted) {
+        setState(() => _isLoading = false);
+      }
+    }
+  }
+
+  void _openDrawer() {
+    final state = context.findAncestorStateOfType<TenantScreenState>();
+    state?.openDrawer();
+  }
+
+  Future<void> _handleRefresh() async {
+    if (!mounted) return;
+    setState(() => _isRefreshing = true);
+    await _loadPaymentData();
+    if (mounted) {
+      setState(() => _isRefreshing = false);
+      SnackbarHelper.showSuccess(context, 'Payments refreshed');
+    }
+  }
+
+  double _getTotalDue() {
+    if (_currentBill == null) return 0;
+    final total = _currentBill!.totalAmount + _currentBill!.fineAmount - _currentBill!.paidAmount;
+    return total > 0 ? total : 0;
+  }
+
+  double _getScopeDue() {
+    if (_paymentScope == 'outstanding') return _currentBill?.totalOutstanding ?? 0;
+    return _getTotalDue();
+  }
+
+  void _setPaymentScope(String scope) {
+    if (scope == _paymentScope) return;
+    setState(() {
+      _paymentScope = scope;
+      _scopedQrUrl = null;
+      _scopedUpiLink = null;
+      _scopedQrAmount = null;
+      _partialQrUrl = null;
+      _partialUpiLink = null;
+      _partialAmount = _getScopeDue();
+      _partialAmountController.text = _partialAmount?.toStringAsFixed(2) ?? '';
+    });
+  }
+
+  String _getFormattedDate(DateTime? date) {
+    if (date == null) return 'N/A';
+    return DateFormat('dd MMM, yyyy').format(date);
+  }
+
+  Future<void> _pickPaymentScreenshot() async {
+    final picker = ImagePicker();
+    try {
+      final XFile? pickedFile = await picker.pickImage(
+        source: ImageSource.gallery,
+        imageQuality: 80,
+        maxWidth: 1024,
+        maxHeight: 1024,
+      );
+      if (pickedFile != null) {
+        if (kIsWeb) {
+          final bytes = await pickedFile.readAsBytes();
+          final base64Image = base64Encode(bytes);
+          setState(() {
+            _paymentScreenshotPath = 'data:image/jpeg;base64,$base64Image';
+          });
+        } else {
+          setState(() {
+            _paymentScreenshotPath = pickedFile.path;
+          });
+        }
+      }
+    } catch (e) {
+      if (mounted) {
+        SnackbarHelper.showError(context, 'Failed to pick image');
+      }
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    super.build(context);
+
+    final double bottomSafeArea = MediaQuery.of(context).padding.bottom;
+    const double navBarClearance = 96.0;
+
+    if (_isLoading) {
+      return Scaffold(
+        backgroundColor: kLivinkeyBlack,
+        body: Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              const CircularProgressIndicator(valueColor: AlwaysStoppedAnimation<Color>(kLivinkeyGreen)),
+              const SizedBox(height: 16),
+              Text('Loading payments...', style: TextStyle(color: Colors.white.withOpacity(0.5))),
+            ],
+          ),
+        ),
+      );
+    }
+
+    return Scaffold(
+      backgroundColor: kLivinkeyBlack,
+      appBar: AppBar(
+        backgroundColor: kLivinkeyBlack,
+        elevation: 0,
+        scrolledUnderElevation: 0,
+        leading: IconButton(
+          icon: Container(
+            padding: const EdgeInsets.all(6),
+            decoration: BoxDecoration(
+              color: Colors.white.withOpacity(0.06),
+              borderRadius: BorderRadius.circular(10),
+            ),
+            child: const Icon(Icons.menu_rounded, color: Colors.white, size: 22),
+          ),
+          onPressed: _openDrawer,
+        ),
+        title: const Text('Payments', style: TextStyle(fontSize: 19, fontWeight: FontWeight.w700)),
+        actions: [
+          IconButton(
+            icon: Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.06),
+                borderRadius: BorderRadius.circular(10),
+              ),
+              child: Icon(Icons.history_rounded, color: Colors.white.withOpacity(0.8), size: 22),
+            ),
+            onPressed: () => _showPaymentHistory(context),
+          ),
+          const SizedBox(width: 8),
+        ],
+      ),
+      body: RefreshIndicator(
+        onRefresh: _handleRefresh,
+        color: kLivinkeyGreen,
+        backgroundColor: kLivinkeyBlack,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              begin: Alignment.topCenter,
+              end: Alignment.bottomCenter,
+              colors: [kLivinkeyGreen.withOpacity(0.05), kLivinkeyBlack, kLivinkeyBlack],
+              stops: const [0.0, 0.3, 1.0],
+            ),
+          ),
+          child: FadeTransition(
+            opacity: _fadeAnimation,
+            child: SlideTransition(
+              position: _slideAnimation,
+              child: SingleChildScrollView(
+                physics: const BouncingScrollPhysics(parent: AlwaysScrollableScrollPhysics()),
+                padding: EdgeInsets.fromLTRB(20, 8, 20, 32 + navBarClearance + bottomSafeArea),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const SizedBox(height: 8),
+
+                    _buildPaymentStats(),
+                    if (_currentBill != null) ...[
+                      const SizedBox(height: 16),
+                      BillBreakdownCard(bill: _currentBill!),
+                    ],
+                    const SizedBox(height: 28),
+
+                    Row(
+                      children: [
+                        Container(
+                          width: 4,
+                          height: 18,
+                          decoration: BoxDecoration(color: kLivinkeyGreen, borderRadius: BorderRadius.circular(2)),
+                        ),
+                        const SizedBox(width: 8),
+                        const Text('Payment Method', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w800)),
+                      ],
+                    ),
+                    const SizedBox(height: 14),
+
+                    Row(
+                      children: [
+                        PaymentChip(
+                          label: 'Pay Online',
+                          isSelected: _selectedPaymentMethod == 0,
+                          onTap: () => setState(() => _selectedPaymentMethod = 0),
+                        ),
+                        const SizedBox(width: 10),
+                        PaymentChip(
+                          label: 'Pay Cash',
+                          isSelected: _selectedPaymentMethod == 1,
+                          onTap: () => setState(() => _selectedPaymentMethod = 1),
+                        ),
+                        const SizedBox(width: 10),
+                        PaymentChip(
+                          label: 'Partial Payment',
+                          isSelected: _selectedPaymentMethod == 2,
+                          onTap: () => setState(() => _selectedPaymentMethod = 2),
+                        ),
+                      ],
+                    ),
+
+                    const SizedBox(height: 20),
+                    
+                    _buildPaymentScopeSelector(),
+                    if ((_currentBill?.outstandingBills.length ?? 0) > 1) ...[
+                      const SizedBox(height: 14),
+                      _buildOutstandingBillsList(),
+                    ],
+                    const SizedBox(height: 16),
+                    _buildPaymentDetailsCard(),
+                    const SizedBox(height: 16),
+                    _buildQRSection(),
+                    const SizedBox(height: 16),
+
+                    if (_currentBill?.hasMeterImages == true)
+                      Column(
+                        children: [
+                          Row(
+                            children: [
+                              Container(
+                                width: 4,
+                                height: 18,
+                                decoration: BoxDecoration(color: kLivinkeyGreen, borderRadius: BorderRadius.circular(2)),
+                              ),
+                              const SizedBox(width: 8),
+                              Text(
+                                (_currentBill!.meterImageUrls.length > 1)
+                                    ? 'Electricity Meter Images'
+                                    : 'Electricity Meter',
+                                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w800),
+                              ),
+                            ],
+                          ),
+                          const SizedBox(height: 12),
+                          _buildMeterCard(),
+                          const SizedBox(height: 20),
+                        ],
+                      ),
+
+                    _buildSubmitProofButton(),
+                    const SizedBox(height: 8),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildPaymentStats() {
+    final currentDue = _getTotalDue();
+    final totalOutstanding = _currentBill?.totalOutstanding ?? currentDue;
+    final previousDue = (totalOutstanding - currentDue).clamp(0, double.infinity).toDouble();
+    final hasBill = _currentBill != null;
+    final status = _currentBill?.status ?? 'No bill';
+    final statusLabel = status == 'partially_paid' ? 'Partially paid' :
+        status == 'paid' ? 'Paid' :
+        status == 'pending' ? 'Pending' :
+        status == 'overdue' ? 'Overdue' : status;
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [kLivinkeyGreen.withOpacity(0.12), Colors.white.withOpacity(0.025)],
+        ),
+        borderRadius: BorderRadius.circular(22),
+        border: Border.all(color: kLivinkeyGreen.withOpacity(0.16)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            totalOutstanding > 0.005 ? 'Amount you need to pay' : 'Your payment status',
+            style: TextStyle(color: Colors.white.withOpacity(0.62), fontSize: 13, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 4),
+          Text(
+            fmtINR(totalOutstanding),
+            style: const TextStyle(color: Colors.white, fontSize: 30, fontWeight: FontWeight.w900),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            totalOutstanding > 0.005
+                ? (previousDue > 0.005
+                    ? '${_currentBill!.outstandingBills.length} unpaid bills • ${fmtINR(previousDue)} from earlier bills'
+                    : '1 current bill outstanding')
+                : 'There is nothing currently due.',
+            style: TextStyle(color: Colors.white.withOpacity(0.48), fontSize: 12.5),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              _buildMiniInfo('Current bill', fmtINR(currentDue), currentDue > 0.005 ? Colors.orange : kLivinkeyGreen),
+              _buildMiniInfo('Status', hasBill ? statusLabel : 'No bill',
+                  status == 'paid' ? kLivinkeyGreen : (status == 'partially_paid' ? Colors.orange : Colors.white)),
+            ],
+          ),
+          if (hasBill && (_currentBill!.otherCharges > 0 || (_currentBill!.otherChargesNote?.isNotEmpty == true))) ...[
+            const SizedBox(height: 12),
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.white.withOpacity(0.04),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.white.withOpacity(0.06)),
+              ),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    'Other charges: ${fmtINR(_currentBill!.otherCharges)}',
+                    style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w700),
+                  ),
+                  if (_currentBill!.otherChargesNote?.isNotEmpty == true) ...[
+                    const SizedBox(height: 4),
+                    Text(
+                      _currentBill!.otherChargesNote!,
+                      style: TextStyle(color: Colors.white.withOpacity(0.65), fontSize: 12.5, height: 1.35),
+                    ),
+                  ],
+                ],
+              ),
+            ),
+          ],
+          if (hasBill && _currentBill!.billingMonth?.isNotEmpty == true) ...[
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Icon(Icons.calendar_month_outlined, size: 15, color: Colors.white.withOpacity(0.45)),
+                const SizedBox(width: 7),
+                Text('Current bill: ${_currentBill!.billingMonth}', style: TextStyle(color: Colors.white.withOpacity(0.62), fontSize: 12)),
+                if (_currentBill!.isOverdue) ...[
+                  const SizedBox(width: 10),
+                  Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3),
+                    decoration: BoxDecoration(color: Colors.red.withOpacity(0.14), borderRadius: BorderRadius.circular(8)),
+                    child: const Text('OVERDUE', style: TextStyle(color: Colors.redAccent, fontSize: 9, fontWeight: FontWeight.w800)),
+                  ),
+                ],
+              ],
+            ),
+          ],
+          if (hasBill) ...[
+            const SizedBox(height: 14),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.black.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(14),
+              ),
+              child: Row(
+                children: [
+                  const Icon(Icons.receipt_long_outlined, color: kLivinkeyGreen, size: 20),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Text(
+                      totalOutstanding > currentDue + 0.005
+                          ? 'You have older unpaid bills too. You can pay just this bill or clear everything together below.'
+                          : 'This is the bill currently due for payment.',
+                      style: TextStyle(color: Colors.white.withOpacity(0.65), fontSize: 12, height: 1.35),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMiniInfo(String label, String value, Color color) {
+    return Expanded(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(label, style: TextStyle(color: Colors.white.withOpacity(0.38), fontSize: 10.5)),
+          const SizedBox(height: 3),
+          Text(value, style: TextStyle(color: color, fontSize: 14.5, fontWeight: FontWeight.w800)),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildStatItem(String label, String value, Color color) {
+    return Expanded(
+      child: Padding(
+        padding: const EdgeInsets.symmetric(vertical: 4),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(label, style: TextStyle(color: Colors.white.withOpacity(0.45), fontSize: 11.5)),
+            const SizedBox(height: 4),
+            Text(value, style: TextStyle(color: color, fontSize: 16.5, fontWeight: FontWeight.w700)),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<void> _generatePartialQR() async {
+    final bill = _currentBill;
+    final amount = _partialAmount;
+    if (bill == null || amount == null || amount <= 0) return;
+    final due = _getScopeDue();
+    if (amount > due + 0.005) {
+      SnackbarHelper.showError(context, 'Amount exceeds the selected payment scope due of ${fmtINR(due)}.');
+      return;
+    }
+    if (amount < due - 0.005 && amount < due * 0.5 - 0.005) {
+      SnackbarHelper.showError(context, 'Partial payment must be at least 50% of the selected payment scope: ${fmtINR(due * 0.5)}.');
+      return;
+    }
+    setState(() => _isGeneratingPartialQr = true);
+    try {
+      final response = await _api.generatePaymentQR(
+        scope: _paymentScope,
+        billId: _paymentScope == 'bill' ? bill.id : null,
+        amount: amount,
+      );
+      if (response['success'] == true) {
+        final data = Map<String, dynamic>.from(response['data'] ?? {});
+        setState(() {
+          _partialQrUrl = data['qr_code']?.toString();
+          _partialUpiLink = data['upi_link']?.toString();
+        });
+      } else {
+        SnackbarHelper.showError(context, response['message']?.toString() ?? 'Unable to generate payment QR');
+      }
+    } finally {
+      if (mounted) setState(() => _isGeneratingPartialQr = false);
+    }
+  }
+
+  Future<void> _generateScopedFullQR() async {
+    final bill = _currentBill;
+    final due = _getScopeDue();
+    if (bill == null || due <= 0) return;
+    setState(() => _isGeneratingScopedQr = true);
+    try {
+      final response = await _api.generatePaymentQR(
+        scope: _paymentScope,
+        billId: _paymentScope == 'bill' ? bill.id : null,
+        amount: due,
+      );
+      if (response['success'] == true) {
+        final data = Map<String, dynamic>.from(response['data'] ?? {});
+        setState(() {
+          _scopedQrUrl = data['qr_code']?.toString();
+          _scopedUpiLink = data['upi_link']?.toString();
+          _scopedQrAmount = due;
+        });
+      } else {
+        SnackbarHelper.showError(context, response['message']?.toString() ?? 'Unable to generate payment QR');
+      }
+    } finally {
+      if (mounted) setState(() => _isGeneratingScopedQr = false);
+    }
+  }
+
+  Future<void> _openUPIPayment(double amount, {String? scope}) async {
+    final bill = _currentBill;
+    if (bill == null) return;
+    final paymentScope = scope ?? _paymentScope;
+    final response = await _api.generatePaymentQR(
+      scope: paymentScope,
+      billId: paymentScope == 'bill' ? bill.id : null,
+      amount: amount,
+    );
+    if (response['success'] != true) {
+      SnackbarHelper.showError(context, response['message']?.toString() ?? 'Unable to open payment app');
+      return;
+    }
+    final data = Map<String, dynamic>.from(response['data'] ?? {});
+    final query = UpiPaymentService.queryFrom(data['upi_link']?.toString()) ??
+        UpiPaymentService.queryFrom((data['app_links'] is Map ? data['app_links']['upi'] : null)?.toString());
+    if (query == null) {
+      SnackbarHelper.showError(context, 'UPI payment is not available right now. Please scan the QR code or use another payment method.');
+      return;
+    }
+    final opened = await UpiAppSheet.show(context, upiQuery: query, amountLabel: fmtINR(amount));
+    if (opened) {
+      _awaitingUpiReturn = true;
+    } else if (mounted) {
+      SnackbarHelper.showWarning(context, 'No UPI app was opened. You can scan the QR code with any UPI app instead.');
+    }
+  }
+
+
+  Widget _buildPaymentScopeSelector() {
+    final totalOutstanding = _currentBill?.totalOutstanding ?? 0;
+    final currentDue = _getTotalDue();
+    if (totalOutstanding <= currentDue + 0.005) {
+      return const SizedBox.shrink();
+    }
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.03),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withOpacity(0.08)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Text('Choose what you want to pay',
+              style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w800)),
+          const SizedBox(height: 6),
+          Text('Select one of the simple options below. Your QR amount will match your choice.',
+              style: TextStyle(color: Colors.white.withOpacity(0.45), fontSize: 12)),
+          const SizedBox(height: 10),
+          Row(children: [
+            Expanded(child: PaymentChip(
+              label: 'Only this bill · ${fmtINR(currentDue)}',
+              isSelected: _paymentScope == 'bill',
+              onTap: () => _setPaymentScope('bill'),
+            )),
+            const SizedBox(width: 8),
+            Expanded(child: PaymentChip(
+              label: 'Everything due · ${fmtINR(totalOutstanding)}',
+              isSelected: _paymentScope == 'outstanding',
+              onTap: () => _setPaymentScope('outstanding'),
+            )),
+          ]),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildOutstandingBillsList() {
+    final bills = _currentBill?.outstandingBills ?? const <OutstandingBill>[];
+    if (bills.length <= 1) return const SizedBox.shrink();
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.025),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: Colors.white.withOpacity(0.07)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.receipt_long_outlined, color: kLivinkeyGreen, size: 19),
+              const SizedBox(width: 8),
+              const Expanded(
+                child: Text('Your unpaid bills', style: TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w800)),
+              ),
+              Text('${bills.length} bills', style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 11)),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Text(
+            'This list explains where your outstanding balance comes from. The payment choice above controls how much you pay.',
+            style: TextStyle(color: Colors.white.withOpacity(0.46), fontSize: 11.5, height: 1.35),
+          ),
+          const SizedBox(height: 12),
+          ...bills.map((item) {
+            final isCurrent = item.id == _currentBill?.id;
+            return Container(
+              margin: const EdgeInsets.only(bottom: 8),
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: isCurrent ? kLivinkeyGreen.withOpacity(0.07) : Colors.black.withOpacity(0.10),
+                borderRadius: BorderRadius.circular(13),
+                border: Border.all(color: isCurrent ? kLivinkeyGreen.withOpacity(0.18) : Colors.white.withOpacity(0.05)),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 34, height: 34,
+                    decoration: BoxDecoration(color: Colors.white.withOpacity(0.05), borderRadius: BorderRadius.circular(10)),
+                    child: Icon(isCurrent ? Icons.star_rounded : Icons.receipt_outlined, size: 18, color: isCurrent ? kLivinkeyGreen : Colors.white54),
+                  ),
+                  const SizedBox(width: 10),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(child: Text(item.billingMonth ?? 'Bill', style: const TextStyle(color: Colors.white, fontSize: 12.5, fontWeight: FontWeight.w700))),
+                            if (isCurrent)
+                              Container(
+                                padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 3),
+                                decoration: BoxDecoration(color: kLivinkeyGreen.withOpacity(0.12), borderRadius: BorderRadius.circular(7)),
+                                child: const Text('CURRENT', style: TextStyle(color: kLivinkeyGreen, fontSize: 8.5, fontWeight: FontWeight.w900)),
+                              ),
+                          ],
+                        ),
+                        if (item.roomNumber != null) ...[
+                          const SizedBox(height: 3),
+                          Text('Room ${item.roomNumber}', style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 10.5)),
+                        ],
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  Text(fmtINR(item.dueAmount), style: const TextStyle(color: Colors.orange, fontSize: 13.5, fontWeight: FontWeight.w900)),
+                ],
+              ),
+            );
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildPaymentDetailsCard() {
+    final bill = _currentBill;
+    if (bill == null) return const SizedBox.shrink();
+    final hasBank = [bill.paymentBankName, bill.paymentAccountHolderName, bill.paymentAccountNumber, bill.paymentIfscCode]
+        .every((v) => v != null && v!.trim().isNotEmpty);
+    final hasUpi = bill.paymentUpiId != null && bill.paymentUpiId!.trim().isNotEmpty;
+    if (!hasBank && !hasUpi) return const SizedBox.shrink();
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.03),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(color: kLivinkeyGreen.withOpacity(0.15)),
+      ),
+      child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('Payment Details', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w800)),
+        const SizedBox(height: 12),
+        if (bill.paymentBankName?.isNotEmpty == true) _buildPaymentDetailRow('Bank Name', bill.paymentBankName!),
+        if (bill.paymentAccountHolderName?.isNotEmpty == true) _buildPaymentDetailRow('Account Holder', bill.paymentAccountHolderName!),
+        if (bill.paymentAccountNumber?.isNotEmpty == true) _buildPaymentDetailRow('Account Number', bill.paymentAccountNumber!),
+        if (bill.paymentIfscCode?.isNotEmpty == true) _buildPaymentDetailRow('IFSC', bill.paymentIfscCode!),
+        if (bill.paymentUpiId?.isNotEmpty == true) _buildPaymentDetailRow('UPI ID', bill.paymentUpiId!),
+        if (bill.paymentDetailsQr?.isNotEmpty == true) ...[
+          const SizedBox(height: 10),
+          const Text('Payment QR Code', style: TextStyle(color: Colors.white70, fontSize: 12, fontWeight: FontWeight.w600)),
+          const SizedBox(height: 8),
+          GestureDetector(
+            onTap: () => _showQRPreview(kLivinkeyGreen, bill.paymentDetailsQr!),
+            child: Container(
+              width: 150, height: 150,
+              padding: const EdgeInsets.all(8),
+              decoration: BoxDecoration(color: Colors.white, borderRadius: BorderRadius.circular(12)),
+              child: Image.network(bill.paymentDetailsQr!, fit: BoxFit.contain, errorBuilder: (_, __, ___) => const Icon(Icons.qr_code_2, size: 80)),
+            ),
+          ),
+        ],
+      ]),
+    );
+  }
+
+  Widget _buildPaymentDetailRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        SizedBox(width: 115, child: Text(label, style: TextStyle(color: Colors.white.withOpacity(0.45), fontSize: 12))),
+        Expanded(child: SelectableText(value, style: const TextStyle(color: Colors.white, fontSize: 13, fontWeight: FontWeight.w600))),
+      ]),
+    );
+  }
+
+  Widget _buildQRSection() {
+    switch (_selectedPaymentMethod) {
+      case 0:
+        final due = _getScopeDue();
+        return Column(
+          children: [
+            _buildQRCard(
+              title: _paymentScope == 'outstanding' ? 'Total Outstanding Payment' : 'Pay This Bill',
+              subtitle: _paymentScope == 'outstanding'
+                  ? 'QR contains the exact total outstanding amount'
+                  : 'QR contains the exact amount due for this bill',
+              qrColor: kLivinkeyGreen,
+              qrUrl: _scopedQrUrl,
+              amount: _scopedQrAmount,
+              isPartial: false,
+              upiLink: _scopedUpiLink,
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: _isGeneratingScopedQr ? null : _generateScopedFullQR,
+                icon: _isGeneratingScopedQr
+                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.qr_code_2),
+                label: Text('Generate payment QR · ${fmtINR(due)}'),
+              ),
+            ),
+          ],
+        );
+
+      case 1:
+        return _buildCashPaymentCard();
+
+      case 2:
+        final due = _getScopeDue();
+        if (_partialAmount == null || _partialAmount! > due) {
+          _partialAmount = due;
+        }
+        return Column(
+          children: [
+            Text(
+              'Minimum 50% of selected scope: ${fmtINR(due * 0.5)}',
+              style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 12),
+              textAlign: TextAlign.center,
+            ),
+            const SizedBox(height: 8),
+            TextField(
+              keyboardType: const TextInputType.numberWithOptions(decimal: true),
+              style: const TextStyle(color: Colors.white),
+              decoration: InputDecoration(
+                labelText: 'Amount to pay',
+                labelStyle: TextStyle(color: Colors.white.withOpacity(0.6)),
+                prefixText: '₹ ',
+                prefixStyle: const TextStyle(color: Colors.orange),
+                helperText: 'One partial payment per bill; subsequent payment must settle that bill.',
+                helperStyle: TextStyle(color: Colors.white.withOpacity(0.45)),
+                filled: true,
+                fillColor: Colors.white.withOpacity(0.05),
+                border: OutlineInputBorder(borderRadius: BorderRadius.circular(12)),
+              ),
+              controller: _partialAmountController..text = _partialAmount?.toStringAsFixed(2) ?? '',
+              onChanged: (v) => _partialAmount = double.tryParse(v),
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                onPressed: _isGeneratingPartialQr ? null : _generatePartialQR,
+                icon: _isGeneratingPartialQr
+                    ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                    : const Icon(Icons.qr_code_2),
+                label: const Text('Generate QR for this amount'),
+              ),
+            ),
+            const SizedBox(height: 12),
+            _buildQRCard(
+              title: _paymentScope == 'outstanding' ? 'Partial Outstanding Payment' : 'Partial Bill Payment',
+              subtitle: 'QR is generated for the exact amount entered',
+              qrColor: Colors.orange,
+              qrUrl: _partialQrUrl,
+              amount: _partialAmount,
+              isPartial: true,
+              upiLink: _partialUpiLink,
+            ),
+          ],
+        );
+
+      default:
+        return const SizedBox.shrink();
+    }
+  }
+
+  Widget _buildQRCard({
+    required String title,
+    required String subtitle,
+    required Color qrColor,
+    String? qrUrl,
+    double? amount,
+    bool isPartial = false,
+    String? upiLink,
+  }) {
+    final displayAmount = amount ?? _getTotalDue();
+
+    if (qrUrl == null || qrUrl.isEmpty) {
+      return Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(28),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [qrColor.withOpacity(0.08), Colors.white.withOpacity(0.02)],
+          ),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: qrColor.withOpacity(0.15)),
+        ),
+        child: Column(
+          children: [
+            Icon(Icons.qr_code_scanner_rounded, color: qrColor.withOpacity(0.4), size: 64),
+            const SizedBox(height: 12),
+            Text(
+              title,
+              style: const TextStyle(color: Colors.white, fontSize: 16.5, fontWeight: FontWeight.w700),
+            ),
+            const SizedBox(height: 4),
+            Text(
+              'No QR code available yet. Please contact admin.',
+              style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 13),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      );
+    }
+
+    return GestureDetector(
+      onTap: () => _showQRPreview(qrColor, qrUrl),
+      child: Container(
+        width: double.infinity,
+        padding: const EdgeInsets.all(28),
+        decoration: BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [qrColor.withOpacity(0.1), Colors.white.withOpacity(0.02)],
+          ),
+          borderRadius: BorderRadius.circular(20),
+          border: Border.all(color: qrColor.withOpacity(0.2)),
+        ),
+        child: Column(
+          children: [
+            Container(
+              width: 128,
+              height: 128,
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(16),
+                boxShadow: [BoxShadow(color: qrColor.withOpacity(0.25), blurRadius: 20, offset: const Offset(0, 8))],
+              ),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(16),
+                child: Image.network(
+                  qrUrl,
+                  fit: BoxFit.contain,
+                  errorBuilder: (context, error, stackTrace) {
+                    return Center(
+                      child: Icon(Icons.qr_code_scanner_rounded, color: qrColor, size: 60),
+                    );
+                  },
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+            Text(title, style: const TextStyle(color: Colors.white, fontSize: 16.5, fontWeight: FontWeight.w700)),
+            const SizedBox(height: 3),
+            Text(subtitle, style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 13)),
+            if (displayAmount > 0)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: Text(
+                  isPartial
+                      ? 'Amount: ${fmtINR(displayAmount)}'
+                      : 'Amount: ${fmtINR(displayAmount)}',
+                  style: TextStyle(color: qrColor, fontSize: 16, fontWeight: FontWeight.w700),
+                ),
+              ),
+            if (displayAmount > 0 && (upiLink != null || !isPartial))
+              Padding(
+                padding: const EdgeInsets.only(top: 12),
+                child: OutlinedButton.icon(
+                  onPressed: () => _openUPIPayment(displayAmount, scope: _paymentScope),
+                  icon: const Icon(Icons.open_in_new),
+                  label: const Text('Open UPI Payment App'),
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCashPaymentCard() {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(28),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Colors.green.withOpacity(0.1), Colors.white.withOpacity(0.02)],
+        ),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: Colors.green.withOpacity(0.2)),
+      ),
+      child: Column(
+        children: [
+          Container(
+            padding: const EdgeInsets.all(18),
+            decoration: BoxDecoration(
+              color: Colors.green.withOpacity(0.12),
+              borderRadius: BorderRadius.circular(18),
+            ),
+            child: const Icon(Icons.attach_money_rounded, color: Colors.green, size: 48),
+          ),
+          const SizedBox(height: 14),
+          const Text('Pay by Cash', style: TextStyle(color: Colors.white, fontSize: 16.5, fontWeight: FontWeight.w700)),
+          const SizedBox(height: 4),
+          Text(
+            'Contact the owner to arrange cash payment',
+            style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 13),
+            textAlign: TextAlign.center,
+          ),
+          const SizedBox(height: 14),
+          InkWell(
+            onTap: () => _launchWhatsApp(),
+            borderRadius: BorderRadius.circular(12),
+            child: Container(
+              padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 11),
+              decoration: BoxDecoration(
+                color: const Color(0xFF25D366).withOpacity(0.15),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFF25D366).withOpacity(0.25)),
+              ),
+              child: const Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(FontAwesomeIcons.whatsapp, color: Color(0xFF25D366), size: 18),
+                  SizedBox(width: 8),
+                  Text('98783 83497', style: TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w600)),
+                ],
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMeterCard() {
+    final urls = _currentBill?.meterImageUrls ?? [];
+    if (urls.isEmpty) {
+      return const SizedBox.shrink();
+    }
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: [Colors.blue.withOpacity(0.08), Colors.white.withOpacity(0.02)],
+        ),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.blue.withOpacity(0.15)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Container(
+                padding: const EdgeInsets.all(8),
+                decoration: BoxDecoration(
+                  color: Colors.blue.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: const Icon(Icons.electric_bolt_rounded, color: Colors.blue, size: 20),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      urls.length > 1 ? 'Meter Readings' : 'Current Meter Reading',
+                      style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w700),
+                    ),
+                    const SizedBox(height: 2),
+                    Text(
+                      urls.length > 1
+                          ? 'Tap an image to view full size'
+                          : 'Tap to view full size',
+                      style: TextStyle(color: Colors.white.withOpacity(0.45), fontSize: 12),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 14),
+          if (urls.length == 1)
+            GestureDetector(
+              onTap: () => _showMeterFullScreen(urls[0], label: 'Meter Reading'),
+              child: ClipRRect(
+                borderRadius: BorderRadius.circular(12),
+                child: AspectRatio(
+                  aspectRatio: 16 / 10,
+                  child: Image.network(
+                    urls[0],
+                    fit: BoxFit.cover,
+                    errorBuilder: (_, __, ___) => Container(
+                      color: Colors.white10,
+                      alignment: Alignment.center,
+                      child: const Icon(Icons.broken_image_outlined, color: Colors.white54),
+                    ),
+                  ),
+                ),
+              ),
+            )
+          else
+            Row(
+              children: [
+                for (int i = 0; i < urls.length; i++) ...[
+                  if (i > 0) const SizedBox(width: 10),
+                  Expanded(
+                    child: GestureDetector(
+                      onTap: () => _showMeterFullScreen(urls[i], label: 'Meter Image ${i + 1}'),
+                      child: Column(
+                        children: [
+                          ClipRRect(
+                            borderRadius: BorderRadius.circular(12),
+                            child: AspectRatio(
+                              aspectRatio: 1,
+                              child: Image.network(
+                                urls[i],
+                                fit: BoxFit.cover,
+                                errorBuilder: (_, __, ___) => Container(
+                                  color: Colors.white10,
+                                  alignment: Alignment.center,
+                                  child: const Icon(Icons.broken_image_outlined, color: Colors.white54),
+                                ),
+                              ),
+                            ),
+                          ),
+                          const SizedBox(height: 6),
+                          Text(
+                            'Image ${i + 1}',
+                            style: TextStyle(color: Colors.white.withOpacity(0.55), fontSize: 11),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ],
+            ),
+        ],
+      ),
+    );
+  }
+
+  void _showMeterFullScreen(String url, {String label = 'Meter Reading'}) {
+    showDialog(
+      context: context,
+      builder: (ctx) => Dialog(
+        backgroundColor: Colors.black,
+        insetPadding: const EdgeInsets.all(12),
+        child: Stack(
+          children: [
+            InteractiveViewer(
+              child: Center(
+                child: Image.network(
+                  url,
+                  fit: BoxFit.contain,
+                  errorBuilder: (_, __, ___) => const Icon(Icons.broken_image_outlined, color: Colors.white54, size: 48),
+                ),
+              ),
+            ),
+            Positioned(
+              top: 8,
+              left: 12,
+              child: Text(label, style: const TextStyle(color: Colors.white70, fontWeight: FontWeight.w600)),
+            ),
+            Positioned(
+              top: 0,
+              right: 0,
+              child: IconButton(
+                icon: const Icon(Icons.close, color: Colors.white),
+                onPressed: () => Navigator.of(ctx).pop(),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSubmitProofButton() {
+    final currentDue = _getTotalDue();
+    final totalOutstanding = _currentBill?.totalOutstanding ?? 0;
+    final hasOutstandingBalance = totalOutstanding > 0.005;
+    final currentBillPaid = currentDue <= 0.005;
+    final canSubmitProof = hasOutstandingBalance;
+    final label = currentBillPaid && hasOutstandingBalance
+        ? 'Submit Outstanding Payment Proof'
+        : 'Submit Payment Proof';
+
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: ElevatedButton(
+        // A paid current bill must not disable proof submission when older
+        // bills are still outstanding. In that case the dialog automatically
+        // switches to the outstanding payment scope.
+        onPressed: canSubmitProof ? () => _showSubmitProofDialog() : null,
+        style: ElevatedButton.styleFrom(
+          backgroundColor: canSubmitProof ? kLivinkeyGreen : Colors.grey,
+          foregroundColor: Colors.black,
+          elevation: 0,
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(Icons.upload_file_rounded, size: 20, color: canSubmitProof ? Colors.black : Colors.grey),
+            const SizedBox(width: 10),
+            Text(
+              canSubmitProof ? label : 'No Payment Due',
+              style: TextStyle(
+                fontWeight: FontWeight.w700,
+                fontSize: 15,
+                color: canSubmitProof ? Colors.black : Colors.grey,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  void _showQRPreview(Color color, String qrUrl) {
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        backgroundColor: const Color(0xFF141414),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(24),
+          side: BorderSide(color: Colors.white.withOpacity(0.06)),
+        ),
+        child: Container(
+          padding: const EdgeInsets.all(28),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Container(
+                width: 200,
+                height: 200,
+                decoration: BoxDecoration(
+                  color: Colors.white,
+                  borderRadius: BorderRadius.circular(16),
+                  boxShadow: [BoxShadow(color: color.withOpacity(0.3), blurRadius: 24, offset: const Offset(0, 10))],
+                ),
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(16),
+                  child: Image.network(
+                    qrUrl,
+                    fit: BoxFit.contain,
+                    errorBuilder: (context, error, stackTrace) {
+                      return Center(
+                        child: Icon(Icons.qr_code_scanner_rounded, color: color, size: 100),
+                      );
+                    },
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              const Text('Scan to Pay', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700)),
+              const SizedBox(height: 16),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () => SnackbarHelper.show(context, 'QR Code ready'),
+                  icon: const Icon(Icons.download_rounded, color: Colors.black, size: 20),
+                  label: const Text('View QR', style: TextStyle(color: Colors.black, fontWeight: FontWeight.w700)),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: kLivinkeyGreen,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    elevation: 0,
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: Text('Close', style: TextStyle(color: Colors.white.withOpacity(0.5))),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showMeterPreview() {
+    final urls = _currentBill?.meterImageUrls ?? [];
+    if (urls.isEmpty) return;
+
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        backgroundColor: const Color(0xFF141414),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(24),
+          side: BorderSide(color: Colors.white.withOpacity(0.06)),
+        ),
+        child: Container(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                urls.length > 1 ? 'Electricity Meter Images' : 'Electricity Meter',
+                style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700),
+              ),
+              const SizedBox(height: 16),
+              ...urls.asMap().entries.map((e) {
+                return Padding(
+                  padding: EdgeInsets.only(bottom: e.key < urls.length - 1 ? 12 : 0),
+                  child: GestureDetector(
+                    onTap: () => _showMeterFullScreen(e.value, label: 'Meter Image ${e.key + 1}'),
+                    child: Container(
+                      width: double.infinity,
+                      height: urls.length > 1 ? 180 : 280,
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.05),
+                        borderRadius: BorderRadius.circular(16),
+                        border: Border.all(color: Colors.white.withOpacity(0.08)),
+                        image: DecorationImage(
+                          image: NetworkImage(e.value),
+                          fit: BoxFit.contain,
+                        ),
+                      ),
+                    ),
+                  ),
+                );
+              }),
+              const SizedBox(height: 16),
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: Text('Close', style: TextStyle(color: Colors.white.withOpacity(0.5))),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  void _showSubmitProofDialog() {
+    String proofScope = _paymentScope;
+    if (_getTotalDue() <= 0.005 && (_currentBill?.totalOutstanding ?? 0) > 0.005) {
+      proofScope = 'outstanding';
+    }
+    _transactionIdController.clear();
+    _amountController.clear();
+    setState(() => _paymentScreenshotPath = null);
+
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setDialogState) {
+          return Dialog(
+            backgroundColor: const Color(0xFF141414),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(24),
+              side: BorderSide(color: Colors.white.withOpacity(0.06)),
+            ),
+            child: Container(
+              padding: const EdgeInsets.all(24),
+              constraints: const BoxConstraints(maxWidth: 400),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        padding: const EdgeInsets.all(8),
+                        decoration: BoxDecoration(
+                          color: kLivinkeyGreen.withOpacity(0.12),
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        child: const Icon(Icons.upload_file_rounded, color: kLivinkeyGreen, size: 22),
+                      ),
+                      const SizedBox(width: 12),
+                      const Expanded(
+                        child: Text(
+                          'Submit Payment Proof',
+                          style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w700),
+                        ),
+                      ),
+                      IconButton(
+                        onPressed: _isSubmittingProof ? null : () => Navigator.pop(context),
+                        icon: Container(
+                          padding: const EdgeInsets.all(4),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.06),
+                            borderRadius: BorderRadius.circular(8),
+                          ),
+                          child: Icon(Icons.close_rounded, color: Colors.white.withOpacity(0.6), size: 18),
+                        ),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 20),
+
+                  if ((_currentBill?.totalOutstanding ?? 0) > 0.005 &&
+                      ((_currentBill?.totalOutstanding ?? 0) > _getTotalDue() + 0.005 || _getTotalDue() <= 0.005))
+                    Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text('Payment Scope', style: TextStyle(color: Colors.white, fontWeight: FontWeight.w700)),
+                        const SizedBox(height: 8),
+                        Row(children: [
+                          if (_getTotalDue() > 0.005) ...[
+                            Expanded(child: PaymentChip(
+                              label: 'This Bill · ${fmtINR(_getTotalDue())}',
+                              isSelected: proofScope == 'bill',
+                              onTap: () => setDialogState(() => proofScope = 'bill'),
+                            )),
+                            const SizedBox(width: 8),
+                          ],
+                          Expanded(child: PaymentChip(
+                            label: 'All Due · ${fmtINR(_currentBill?.totalOutstanding ?? 0)}',
+                            isSelected: proofScope == 'outstanding',
+                            onTap: () => setDialogState(() => proofScope = 'outstanding'),
+                          )),
+                        ]),
+                        const SizedBox(height: 14),
+                      ],
+                    ),
+
+                  TextField(
+                    controller: _transactionIdController,
+                    style: const TextStyle(color: Colors.white),
+                    decoration: InputDecoration(
+                      labelText: 'Transaction ID *',
+                      labelStyle: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 13),
+                      filled: true,
+                      fillColor: Colors.white.withOpacity(0.05),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: const BorderSide(color: kLivinkeyGreen),
+                      ),
+                      prefixIcon: Icon(Icons.receipt_rounded, color: Colors.white.withOpacity(0.4), size: 20),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+
+                  TextField(
+                    controller: _amountController,
+                    style: const TextStyle(color: Colors.white),
+                    keyboardType: TextInputType.number,
+                    decoration: InputDecoration(
+                      labelText: 'Amount Paid (₹) *',
+                      labelStyle: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 13),
+                      filled: true,
+                      fillColor: Colors.white.withOpacity(0.05),
+                      border: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
+                      ),
+                      enabledBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
+                      ),
+                      focusedBorder: OutlineInputBorder(
+                        borderRadius: BorderRadius.circular(12),
+                        borderSide: const BorderSide(color: kLivinkeyGreen),
+                      ),
+                      prefixIcon: Icon(Icons.currency_rupee_rounded, color: Colors.white.withOpacity(0.4), size: 20),
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+
+                  // Payment Screenshot Upload
+                  GestureDetector(
+                    onTap: _pickPaymentScreenshot,
+                    child: Container(
+                      width: double.infinity,
+                      padding: const EdgeInsets.all(16),
+                      decoration: BoxDecoration(
+                        color: Colors.white.withOpacity(0.05),
+                        borderRadius: BorderRadius.circular(12),
+                        border: Border.all(
+                          color: _paymentScreenshotPath != null ? kLivinkeyGreen : Colors.white.withOpacity(0.1),
+                          width: _paymentScreenshotPath != null ? 2 : 1,
+                        ),
+                      ),
+                      child: Column(
+                        children: [
+                          if (_paymentScreenshotPath != null)
+                            _buildScreenshotPreview(_paymentScreenshotPath!)
+                          else ...[
+                            Icon(Icons.image_rounded, color: kLivinkeyGreen.withOpacity(0.6), size: 32),
+                            const SizedBox(height: 6),
+                            Text(
+                              'Tap to upload payment screenshot',
+                              style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 12),
+                            ),
+                            Text(
+                              'PNG, JPG up to 5MB',
+                              style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 10),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                  if (_paymentScreenshotPath != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 8),
+                      child: Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          Icon(Icons.check_circle, color: kLivinkeyGreen, size: 16),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Screenshot attached',
+                            style: TextStyle(color: kLivinkeyGreen.withOpacity(0.7), fontSize: 12),
+                          ),
+                          const SizedBox(width: 12),
+                          GestureDetector(
+                            onTap: () => setDialogState(() => _paymentScreenshotPath = null),
+                            child: Icon(Icons.close_rounded, color: Colors.red.withOpacity(0.7), size: 16),
+                          ),
+                        ],
+                      ),
+                    ),
+                  const SizedBox(height: 20),
+
+                  Row(
+                    children: [
+                      Expanded(
+                        child: TextButton(
+                          onPressed: _isSubmittingProof ? null : () {
+                            _transactionIdController.clear();
+                            _amountController.clear();
+                            setState(() => _paymentScreenshotPath = null);
+                            Navigator.pop(context);
+                          },
+                          child: Text('Cancel', style: TextStyle(color: Colors.white.withOpacity(0.5))),
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        flex: 2,
+                        child: ElevatedButton(
+                          onPressed: _isSubmittingProof ? null : () async {
+                            final transactionId = _transactionIdController.text.trim();
+                            final amount = double.tryParse(_amountController.text.trim());
+
+                            if (transactionId.isEmpty) {
+                              SnackbarHelper.showError(context, 'Please enter Transaction ID');
+                              return;
+                            }
+
+                            final due = proofScope == 'outstanding'
+                                ? (_currentBill?.totalOutstanding ?? 0)
+                                : _getTotalDue();
+                            if (amount == null || amount <= 0) {
+                              SnackbarHelper.showError(context, 'Please enter a valid amount');
+                              return;
+                            }
+                            if (amount > due + 0.005) {
+                              SnackbarHelper.showError(context, 'Amount exceeds the selected payment scope due of ${fmtINR(due)}.');
+                              return;
+                            }
+                            final isPartial = amount < due - 0.005;
+                            if (isPartial && amount < due * 0.5 - 0.005) {
+                              SnackbarHelper.showError(context, 'Partial payment must be at least 50% of the selected payment scope: ${fmtINR(due * 0.5)}.');
+                              return;
+                            }
+
+                            if (_paymentScreenshotPath == null || _paymentScreenshotPath!.isEmpty) {
+                              SnackbarHelper.showError(context, 'Please upload a payment screenshot');
+                              return;
+                            }
+
+                            setDialogState(() => _isSubmittingProof = true);
+
+                            try {
+                              final response = await _api.submitPaymentProof(
+                                billId: proofScope == 'bill' ? (_currentBill?.id ?? 0) : 0,
+                                paymentScope: proofScope,
+                                paymentTargetBillId: proofScope == 'bill' ? (_currentBill?.id ?? 0) : null,
+                                transactionId: transactionId,
+                                amountPaid: amount,
+                                paymentScreenshot: _paymentScreenshotPath!,
+                              );
+
+                              if (!context.mounted) return;
+
+                              if (response['success'] == true) {
+                                Navigator.pop(context);
+                                SnackbarHelper.showSuccess(
+                                  context,
+                                  'Payment proof submitted successfully!',
+                                );
+                                await _loadPaymentData();
+                              } else {
+                                SnackbarHelper.showError(
+                                  context,
+                                  response['message'] ?? 'Failed to submit proof',
+                                );
+                              }
+                            } catch (e) {
+                              SnackbarHelper.showError(
+                                context,
+                                'An error occurred. Please try again.',
+                              );
+                            } finally {
+                              if (mounted) {
+                                setDialogState(() => _isSubmittingProof = false);
+                              }
+                            }
+                          },
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: kLivinkeyGreen,
+                            foregroundColor: Colors.black,
+                            elevation: 0,
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                          ),
+                          child: AnimatedSwitcher(
+                            duration: const Duration(milliseconds: 160),
+                            child: _isSubmittingProof
+                                ? const SizedBox(
+                                    key: ValueKey('spinner'),
+                                    height: 20,
+                                    width: 20,
+                                    child: LoadingIndicator(size: 20, color: Colors.black),
+                                  )
+                                : const Row(
+                                    key: ValueKey('label'),
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(Icons.check_rounded, size: 18),
+                                      SizedBox(width: 8),
+                                      Text('Submit Proof', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 14)),
+                                    ],
+                                  ),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  Widget _buildScreenshotPreview(String path) {
+    if (kIsWeb && path.startsWith('data:image')) {
+      return Container(
+        height: 120,
+        width: double.infinity,
+        decoration: BoxDecoration(
+          borderRadius: BorderRadius.circular(8),
+          border: Border.all(color: kLivinkeyGreen.withOpacity(0.2)),
+        ),
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(8),
+          child: Image.memory(
+            base64Decode(path.split(',').last),
+            fit: BoxFit.cover,
+            errorBuilder: (context, error, stackTrace) {
+              return Container(
+                color: kLivinkeyGreen.withOpacity(0.1),
+                child: const Center(
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      Icon(Icons.image_not_supported, color: Colors.grey, size: 32),
+                      SizedBox(height: 4),
+                      Text('Preview not available', style: TextStyle(color: Colors.grey)),
+                    ],
+                  ),
+                ),
+              );
+            },
+          ),
+        ),
+      );
+    } else if (!kIsWeb) {
+      return ClipRRect(
+        borderRadius: BorderRadius.circular(8),
+        child: Image.file(
+          File(path),
+          height: 120,
+          width: double.infinity,
+          fit: BoxFit.cover,
+          errorBuilder: (context, error, stackTrace) {
+            return Container(
+              height: 120,
+              color: Colors.white.withOpacity(0.05),
+              child: const Center(
+                child: Icon(Icons.broken_image, color: Colors.grey, size: 32),
+              ),
+            );
+          },
+        ),
+      );
+    } else {
+      return Container(
+        height: 120,
+        width: double.infinity,
+        color: kLivinkeyGreen.withOpacity(0.1),
+        child: const Center(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(Icons.image, color: kLivinkeyGreen, size: 32),
+              SizedBox(height: 4),
+              Text('Image selected', style: TextStyle(color: kLivinkeyGreen, fontSize: 12)),
+            ],
+          ),
+        ),
+      );
+    }
+  }
+
+  // ============================================================
+  // FIXED: showPaymentHistory with correct amounts and rejection reason
+  // ============================================================
+  void _showPaymentHistory(BuildContext context) {
+    List<PaymentRecord> allPayments = [];
+    
+    if (_paymentHistory != null) {
+      // Add online payments
+      for (final p in _paymentHistory!.onlinePayments) {
+        allPayments.add(PaymentRecord(
+          id: p.id,
+          billId: p.billId,
+          amount: p.amount,
+          paymentMethod: p.paymentMethod,
+          transactionId: p.transactionId,
+          status: p.status,
+          createdAt: p.createdAt,
+          type: 'online',
+          billTotal: p.billTotal,
+          adminNotes: p.adminNotes,
+          isPartial: p.isPartial,
+          dueBeforePayment: p.dueBeforePayment,
+          dueAfterPayment: p.dueAfterPayment,
+        ));
+      }
+      
+      // Add cash payments
+      for (final p in _paymentHistory!.cashPayments) {
+        allPayments.add(PaymentRecord(
+          id: p.id,
+          billId: p.billId,
+          amount: p.amount,
+          paymentMethod: 'cash',
+          transactionId: p.transactionId,
+          status: p.status,
+          createdAt: p.createdAt,
+          type: 'cash',
+          billTotal: p.billTotal,
+          adminNotes: p.adminNotes,
+          isPartial: p.isPartial,
+          dueBeforePayment: p.dueBeforePayment,
+          dueAfterPayment: p.dueAfterPayment,
+        ));
+      }
+      
+      // Add payment proofs
+      for (final p in _paymentHistory!.paymentProofs) {
+        allPayments.add(PaymentRecord(
+          id: p.id,
+          billId: p.billId,
+          amount: p.amount,
+          paymentMethod: 'proof',
+          transactionId: p.transactionId,
+          status: p.status,
+          createdAt: p.createdAt,
+          type: 'proof',
+          billTotal: p.billTotal,
+          adminNotes: p.adminNotes,
+          isPartial: p.isPartial,
+          dueBeforePayment: p.dueBeforePayment,
+          dueAfterPayment: p.dueAfterPayment,
+        ));
+      }
+    }
+
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF141414),
+      shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
+      builder: (context) => DraggableScrollableSheet(
+        initialChildSize: 0.85,
+        minChildSize: 0.5,
+        maxChildSize: 0.95,
+        expand: false,
+        builder: (context, scrollController) => Container(
+          padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+          child: Column(
+            children: [
+              Container(
+                width: 40,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(2),
+                ),
+              ),
+              const SizedBox(height: 18),
+              Row(
+                children: [
+                  Container(
+                    width: 4,
+                    height: 18,
+                    decoration: BoxDecoration(color: kLivinkeyGreen, borderRadius: BorderRadius.circular(2)),
+                  ),
+                  const SizedBox(width: 8),
+                  const Text('Payment History', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w800)),
+                  const Spacer(),
+                  Text(
+                    '${allPayments.length} payments',
+                    style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 12),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 16),
+              Expanded(
+                child: allPayments.isEmpty
+                    ? Center(
+                        child: Text(
+                          'No payment history',
+                          style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 14),
+                        ),
+                      )
+                    : ListView.separated(
+                        controller: scrollController,
+                        itemCount: allPayments.length,
+                        separatorBuilder: (context, index) => Divider(color: Colors.white.withOpacity(0.05), height: 1),
+                        itemBuilder: (context, index) {
+                          final payment = allPayments[index];
+                          final isPaid = payment.status == 'verified' || payment.status == 'success' || payment.status == 'paid';
+                          final isRejected = payment.status == 'rejected';
+                          final isPending = payment.status == 'pending';
+                          final statusColor = isPaid ? kLivinkeyGreen : (isRejected ? Colors.red : Colors.orange);
+                          
+                          String statusLabel = payment.status;
+                          if (statusLabel == 'verified') statusLabel = 'Verified';
+                          else if (statusLabel == 'success') statusLabel = 'Success';
+                          else if (statusLabel == 'paid') statusLabel = 'Paid';
+                          else if (statusLabel == 'rejected') statusLabel = 'Rejected';
+                          else if (statusLabel == 'pending') statusLabel = 'Pending';
+
+                          return Container(
+                            padding: const EdgeInsets.symmetric(vertical: 14),
+                            child: Row(
+                              children: [
+                                Container(
+                                  padding: const EdgeInsets.all(11),
+                                  decoration: BoxDecoration(
+                                    color: statusColor.withOpacity(0.12),
+                                    borderRadius: BorderRadius.circular(14),
+                                  ),
+                                  child: Icon(
+                                    isPaid ? Icons.check_circle_rounded : (isRejected ? Icons.cancel_rounded : Icons.pending_rounded),
+                                    color: statusColor,
+                                    size: 22,
+                                  ),
+                                ),
+                                const SizedBox(width: 14),
+                                Expanded(
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.start,
+                                    children: [
+                                      Row(
+                                        children: [
+                                          Text(
+                                            fmtINR(payment.amount),
+                                            style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700),
+                                          ),
+                                          const SizedBox(width: 10),
+                                          Container(
+                                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                            decoration: BoxDecoration(
+                                              color: statusColor.withOpacity(0.15),
+                                              borderRadius: BorderRadius.circular(6),
+                                            ),
+                                            child: Text(
+                                              statusLabel.toUpperCase(),
+                                              style: TextStyle(color: statusColor, fontSize: 10, fontWeight: FontWeight.w600),
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        '${DateFormat('dd MMM, yyyy').format(payment.createdAt)} • ${payment.paymentMethod}',
+                                        style: TextStyle(color: Colors.white.withOpacity(0.42), fontSize: 12),
+                                      ),
+                                      if (payment.transactionId != null && payment.transactionId!.isNotEmpty)
+                                        Text(
+                                          payment.transactionId!,
+                                          style: TextStyle(color: Colors.white.withOpacity(0.22), fontSize: 10),
+                                        ),
+                                      if (payment.dueAfterPayment != null)
+                                        Text(
+                                          'Remaining balance: ${fmtINR(payment.dueAfterPayment!)}',
+                                          style: TextStyle(color: Colors.white.withOpacity(0.32), fontSize: 11),
+                                        ),
+                                      // ============================================================
+                                      // FIXED: Show rejection reason when status is rejected
+                                      // ============================================================
+                                      if (isRejected && payment.adminNotes != null && payment.adminNotes!.isNotEmpty)
+                                        Container(
+                                          margin: const EdgeInsets.only(top: 4),
+                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                                          decoration: BoxDecoration(
+                                            color: Colors.red.withOpacity(0.1),
+                                            borderRadius: BorderRadius.circular(6),
+                                            border: Border.all(color: Colors.red.withOpacity(0.2)),
+                                          ),
+                                          child: Row(
+                                            crossAxisAlignment: CrossAxisAlignment.start,
+                                            children: [
+                                              Icon(Icons.info_outline, color: Colors.red, size: 14),
+                                              const SizedBox(width: 6),
+                                              Expanded(
+                                                child: Text(
+                                                  'Reason: ${payment.adminNotes}',
+                                                  style: TextStyle(color: Colors.red.withOpacity(0.8), fontSize: 12),
+                                                ),
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                    ],
+                                  ),
+                                ),
+                if (isPaid) ElevatedButton(
+                  onPressed: _isDownloadingReceipt && _downloadingReceiptId == payment.id
+                      ? null
+                      : () => _handleDownloadReceipt(context, payment),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: kLivinkeyGreen,
+                    foregroundColor: Colors.black,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+                    minimumSize: const Size(80, 32),
+                  ),
+                  child: _isDownloadingReceipt && _downloadingReceiptId == payment.id
+                      ? const SizedBox(
+                          height: 16,
+                          width: 16,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(Colors.black),
+                          ),
+                        )
+                      : const Text('Receipt', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 11)),
+                ),
+                              ],
+                            ),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ============================================================
+  // FIXED: Receipt download with token as query parameter
+  // The backend authMiddleware supports token from query params
+  // ============================================================
+  Future<void> _handleDownloadReceipt(BuildContext context, PaymentRecord payment) async {
+  if (_isDownloadingReceipt) return;
+  
+  setState(() {
+    _isDownloadingReceipt = true;
+    _downloadingReceiptId = payment.id;
+  });
+
+  try {
+    String type = 'online';
+    if (payment.type == 'cash' || payment.paymentMethod == 'cash') {
+      type = 'cash';
+    } else if (payment.type == 'proof' || payment.paymentMethod == 'proof') {
+      type = 'proof';
+    }
+
+
+    // ============================================================
+    // FIXED: Use TENANT receipt endpoint, not admin endpoint
+    // The tenant routes use tenantAuthMiddleware which accepts tenant tokens
+    // ============================================================
+    final receiptUrl = await _api.buildAuthorizedUrl(
+      '/tenant-payments/receipt/$type/${payment.id}/download',
+      scope: 'tenant',
+    );
+    if (receiptUrl == null) {
+      SnackbarHelper.showError(context, "We couldn't prepare your receipt. Please check your connection and try again.");
+      return;
+    }
+
+
+    final uri = Uri.parse(receiptUrl);
+    
+    if (await canLaunchUrl(uri)) {
+      await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+      );
+      SnackbarHelper.showSuccess(context, 'Receipt opened successfully');
+    } else {
+      try {
+        if (await canLaunchUrl(uri)) {
+          await launchUrl(uri, mode: LaunchMode.externalNonBrowserApplication);
+        } else {
+          SnackbarHelper.showError(context, 'Could not open receipt. Please check your internet connection.');
+        }
+      } catch (e) {
+        SnackbarHelper.showError(context, "We couldn't open the receipt. Please try again.");
+      }
+    }
+  } catch (e) {
+    SnackbarHelper.showError(context, "We couldn't open the receipt. Please try again.");
+  } finally {
+    if (mounted) {
+      setState(() {
+        _isDownloadingReceipt = false;
+        _downloadingReceiptId = null;
+      });
+    }
+  }
+}
+
+  void _showReceiptPreview(BuildContext context, PaymentRecord payment) {
+    showDialog(
+      context: context,
+      builder: (context) => Dialog(
+        backgroundColor: const Color(0xFF141414),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(24),
+          side: BorderSide(color: Colors.white.withOpacity(0.06)),
+        ),
+        child: Container(
+          padding: const EdgeInsets.all(26),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text('Payment Receipt', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w800)),
+              const SizedBox(height: 18),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.all(20),
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    begin: Alignment.topLeft,
+                    end: Alignment.bottomRight,
+                    colors: [kLivinkeyGreen.withOpacity(0.1), Colors.white.withOpacity(0.02)],
+                  ),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: kLivinkeyGreen.withOpacity(0.14)),
+                ),
+                child: Column(
+                  children: [
+                    _buildReceiptRow('Amount', fmtINR(payment.amount)),
+                    _buildReceiptRow('Date', DateFormat('dd MMM, yyyy').format(payment.createdAt)),
+                    if (payment.transactionId != null) _buildReceiptRow('Transaction ID', payment.transactionId!),
+                    _buildReceiptRow('Payment Mode', payment.paymentMethod),
+                    _buildReceiptRow('Status', payment.status, isStatus: true),
+                    if (payment.status == 'rejected' && payment.adminNotes != null && payment.adminNotes!.isNotEmpty)
+                      _buildReceiptRow('Rejection Reason', payment.adminNotes!, isStatus: true, isRejectionReason: true),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 18),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton.icon(
+                  onPressed: () => _handleDownloadReceipt(context, payment),
+                  icon: _isDownloadingReceipt && _downloadingReceiptId == payment.id
+                      ? const SizedBox(
+                          height: 20,
+                          width: 20,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            valueColor: AlwaysStoppedAnimation<Color>(Colors.black),
+                          ),
+                        )
+                      : const Icon(Icons.download_rounded, color: Colors.black, size: 20),
+                  label: Text(
+                    _isDownloadingReceipt && _downloadingReceiptId == payment.id
+                        ? 'Downloading...'
+                        : 'Download Receipt',
+                    style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w700),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: kLivinkeyGreen,
+                    elevation: 0,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 6),
+              TextButton(
+                onPressed: () => Navigator.pop(context),
+                child: Text('Close', style: TextStyle(color: Colors.white.withOpacity(0.5))),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  // ============================================================
+  // FIXED: _buildReceiptRow - NO icon or child parameters
+  // ============================================================
+  Widget _buildReceiptRow(String label, String value, {bool isStatus = false, bool isRejectionReason = false}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 7),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          Text(label, style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 13)),
+          Text(
+            value,
+            style: TextStyle(
+              color: isStatus 
+                  ? (value.toLowerCase().contains('rejected') ? Colors.red : kLivinkeyGreen) 
+                  : (isRejectionReason ? Colors.red : Colors.white),
+              fontSize: 13,
+              fontWeight: isStatus || isRejectionReason ? FontWeight.w700 : FontWeight.w600,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _launchWhatsApp() async {
+    try {
+      if (await canLaunchUrl(Uri.parse(kWhatsAppUrl))) {
+        await launchUrl(Uri.parse(kWhatsAppUrl), mode: LaunchMode.externalApplication);
+      }
+    } catch (_) {}
+  }
+}
+
+String fmtINR(double amount) {
+  return '₹${NumberFormat('#,##,##0.00', 'en_IN').format(amount)}';
+}
