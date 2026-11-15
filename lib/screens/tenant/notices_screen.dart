@@ -1,3 +1,4 @@
+import '../../widgets/common/state_views.dart';
 import 'package:flutter/material.dart';
 import '../../services/api_service.dart';
 import '../../utils/constants.dart';
@@ -62,7 +63,7 @@ class _NoticesScreenState extends State<NoticesScreen> {
 
   Widget _buildBody() {
     if (_loading) {
-      return const Center(child: CircularProgressIndicator(color: kLivinkeyGreen));
+      return const SkeletonList(count: 4, itemHeight: 110);
     }
     if (_error != null) {
       return ListView(

@@ -1,4 +1,5 @@
 // lib/screens/tenant/maintenance_screen.dart
+import '../../widgets/common/state_views.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -183,16 +184,7 @@ class _MaintenanceScreenState extends State<MaintenanceScreen>
     if (_isLoading) {
       return Scaffold(
         backgroundColor: kLivinkeyBlack,
-        body: Center(
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              const CircularProgressIndicator(valueColor: AlwaysStoppedAnimation<Color>(kLivinkeyGreen)),
-              const SizedBox(height: 16),
-              Text('Loading maintenance...', style: TextStyle(color: Colors.white.withOpacity(0.5))),
-            ],
-          ),
-        ),
+        body: const SkeletonList(count: 4, itemHeight: 104),
       );
     }
 

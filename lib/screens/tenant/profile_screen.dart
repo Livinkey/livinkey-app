@@ -367,11 +367,11 @@ class _ProfileScreenState extends State<ProfileScreen>
                             ProfileRow(label: 'Room No', value: _roomNumber),
                             ProfileRow(
                               label: 'Rent',
-                              value: '₹${_rent.toStringAsFixed(2)}/month'
+                              value: '₹${(_rent < 0 ? 0 : _rent).toStringAsFixed(2)}/month'
                             ),
                             ProfileRow(
                               label: 'Security Fee',
-                              value: '₹${_securityFee.toStringAsFixed(2)}'
+                              value: '₹${(_securityFee < 0 ? 0 : _securityFee).toStringAsFixed(2)}'
                             ),
                             ProfileRow(label: 'Nationality', value: _nationality),
                             ProfileRow(label: 'Period of Stay', value: _periodOfStay > 0 ? '${_periodOfStay} Month${_periodOfStay == 1 ? '' : 's'}' : 'Not set'),

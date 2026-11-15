@@ -661,6 +661,54 @@ class ApiService {
     }
   }
 
+
+  // ============ ROOMMATES & CHECKOUT (tenant self-service) ============
+
+  Future<Map<String, dynamic>> getRoommates() async {
+    try {
+      final response = await _dio.get('/tenants/roommates');
+      return Map<String, dynamic>.from(response.data as Map);
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data is Map) {
+        return Map<String, dynamic>.from(e.response!.data as Map);
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> getCheckoutEligibility() async {
+    try {
+      final response = await _dio.get('/tenants/checkout/eligibility');
+      return Map<String, dynamic>.from(response.data as Map);
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data is Map) {
+        return Map<String, dynamic>.from(e.response!.data as Map);
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
+  Future<Map<String, dynamic>> checkoutSelf({String? reason}) async {
+    try {
+      final response = await _dio.post('/tenants/checkout', data: {
+        'confirm': true,
+        if (reason != null && reason.trim().isNotEmpty) 'reason': reason.trim(),
+      });
+      return Map<String, dynamic>.from(response.data as Map);
+    } on DioException catch (e) {
+      if (e.response != null && e.response!.data is Map) {
+        return Map<String, dynamic>.from(e.response!.data as Map);
+      }
+      return {'success': false, 'message': 'You appear to be offline. Check your connection and try again.'};
+    } catch (e) {
+      return {'success': false, 'message': 'Something went wrong. Please try again.'};
+    }
+  }
+
   // ============ GUEST ENDPOINTS ============
 
   Future<Map<String, dynamic>> getGuestDashboard() async {
@@ -857,7 +905,6 @@ class ApiService {
 
   Future<Map<String, dynamic>> submitPaymentProof({
     required int billId,
-    required String transactionId,
     required double amountPaid,
     required String paymentScreenshot,
     String paymentScope = 'bill',
@@ -869,9 +916,6 @@ class ApiService {
       }
       if (paymentScope == 'outstanding' && billId < 0) {
         return {'success': false, 'message': 'Invalid payment scope'};
-      }
-      if (transactionId.isEmpty) {
-        return {'success': false, 'message': 'Transaction ID is required'};
       }
       if (amountPaid <= 0) {
         return {'success': false, 'message': 'Amount must be greater than 0'};
@@ -888,7 +932,6 @@ class ApiService {
       if (paymentTargetBillId != null) {
         formData.fields.add(MapEntry('payment_target_bill_id', paymentTargetBillId.toString()));
       }
-      formData.fields.add(MapEntry('transaction_id', transactionId));
       formData.fields.add(MapEntry('amount_paid', amountPaid.toString()));
 
       try {

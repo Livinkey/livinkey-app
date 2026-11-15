@@ -1,3 +1,4 @@
+import '../../widgets/common/state_views.dart';
 import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -334,11 +335,7 @@ class _NotificationScreenState extends State<NotificationScreen>
         ],
       ),
       body: _isLoading
-          ? const Center(
-              child: CircularProgressIndicator(
-                valueColor: AlwaysStoppedAnimation<Color>(kLivinkeyGreen),
-              ),
-            )
+          ? const SkeletonList(count: 6, itemHeight: 78)
           : FadeTransition(
               opacity: _fadeAnimation,
               child: SlideTransition(

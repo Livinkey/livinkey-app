@@ -1,3 +1,4 @@
+import '../../widgets/common/state_views.dart';
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 import '../../utils/constants.dart';
@@ -99,9 +100,7 @@ class _AgreementsScreenState extends State<AgreementsScreen> {
         ],
       ),
       body: _loading
-          ? const Center(
-              child: CircularProgressIndicator(color: kLivinkeyGreen),
-            )
+          ? const SkeletonList(count: 3, itemHeight: 120)
           : _error != null
               ? Center(
                   child: Padding(

@@ -15,6 +15,8 @@ import '../guest/guest_screen.dart';
 import 'agreements_screen.dart';
 import 'notices_screen.dart';
 import 'vehicle_screen.dart';
+import 'roommates_screen.dart';
+import 'checkout_screen.dart';
 
 class TenantDrawer extends StatelessWidget {
   /// Current bottom-nav tab (0 Home … 4 Profile) for active highlight.
@@ -102,6 +104,21 @@ class TenantDrawer extends StatelessWidget {
                             Navigator.of(context).push(MaterialPageRoute(builder: (_) => const VehicleScreen()));
                           },
                         ),
+                        // Only tenants who actually share a room see this entry.
+                        FutureBuilder<bool>(
+                          future: RoommateAvailability.hasRoommates(),
+                          builder: (context, snap) {
+                            if (snap.data != true) return const SizedBox.shrink();
+                            return _buildDrawerItem(
+                              icon: Icons.people_alt_rounded,
+                              title: 'Roommate details',
+                              onTap: () {
+                                Navigator.pop(context);
+                                Navigator.of(context).push(MaterialPageRoute(builder: (_) => const RoommatesScreen()));
+                              },
+                            );
+                          },
+                        ),
                         _buildDrawerItem(
                           icon: Icons.campaign_rounded,
                           title: 'Notices',
@@ -129,6 +146,15 @@ class TenantDrawer extends StatelessWidget {
                           },
                         ),
                         const Divider(color: Colors.white24, height: 24),
+                        _buildDrawerItem(
+                          icon: Icons.exit_to_app_rounded,
+                          title: 'Check out',
+                          color: const Color(0xFFEF5350),
+                          onTap: () {
+                            Navigator.pop(context);
+                            Navigator.of(context).push(MaterialPageRoute(builder: (_) => const CheckoutScreen()));
+                          },
+                        ),
                         _buildDrawerItem(
                           icon: Icons.switch_account_rounded,
                           title: 'Enter as Guest',

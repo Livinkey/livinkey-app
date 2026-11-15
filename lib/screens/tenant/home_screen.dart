@@ -1170,6 +1170,8 @@ class _NotificationBellState extends State<_NotificationBell> {
 
 // Helper function for INR formatting
 String fmtINR(dynamic amount) {
-  final num = amount is double ? amount : (amount ?? 0).toDouble();
-  return '₹${NumberFormat('#,##,##0.00', 'en_IN').format(num)}';
+  var value = amount is num ? amount.toDouble() : (double.tryParse('${amount ?? 0}') ?? 0.0);
+  // Money shown to tenants is never negative / NaN (e.g. an overpayment shows as ₹0.00 due).
+  if (value.isNaN || value.isInfinite || value < 0) value = 0;
+  return '₹${NumberFormat('#,##,##0.00', 'en_IN').format(value)}';
 }

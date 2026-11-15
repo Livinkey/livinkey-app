@@ -1,4 +1,5 @@
 // lib/services/session_manager.dart
+import '../screens/tenant/roommates_screen.dart' show RoommateAvailability;
 import 'package:flutter/material.dart';
 import '../screens/auth/login_screen.dart';
 import '../utils/constants.dart';
@@ -23,6 +24,7 @@ class SessionManager {
   /// removed on a best-effort basis (4s max), then the local session is cleared
   /// and the whole navigation stack is replaced with the login screen.
   Future<void> logout() async {
+    RoommateAvailability.reset();
     try {
       await PushNotificationService().removeToken().timeout(const Duration(seconds: 4));
     } catch (_) {}

@@ -3,6 +3,7 @@ import 'dart:io';
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:font_awesome_flutter/font_awesome_flutter.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:intl/intl.dart';
@@ -16,6 +17,7 @@ import '../../services/notification_service.dart';
 import '../../widgets/tenant/payment_chip.dart';
 import '../../widgets/tenant/bill_breakdown_card.dart';
 import '../../widgets/tenant/upi_app_sheet.dart';
+import '../../widgets/tenant/receipt_sheet.dart';
 import '../../services/app_events.dart';
 import '../../widgets/common/snackbar_helper.dart';
 import '../../widgets/common/loading_indicator.dart';
@@ -48,7 +50,6 @@ class _PaymentsScreenState extends State<PaymentsScreen>
   BillModel? _currentBill;
   PaymentHistory? _paymentHistory;
 
-  final TextEditingController _transactionIdController = TextEditingController();
   final TextEditingController _amountController = TextEditingController();
   final TextEditingController _partialAmountController = TextEditingController();
   bool _isSubmittingProof = false;
@@ -162,7 +163,6 @@ class _PaymentsScreenState extends State<PaymentsScreen>
     AppEvents.refreshTick.removeListener(_onExternalRefresh);
     WidgetsBinding.instance.removeObserver(this);
     _fadeController.dispose();
-    _transactionIdController.dispose();
     _amountController.dispose();
     _partialAmountController.dispose();
     super.dispose();
@@ -1456,7 +1456,6 @@ class _PaymentsScreenState extends State<PaymentsScreen>
     if (_getTotalDue() <= 0.005 && (_currentBill?.totalOutstanding ?? 0) > 0.005) {
       proofScope = 'outstanding';
     }
-    _transactionIdController.clear();
     _amountController.clear();
     setState(() => _paymentScreenshotPath = null);
 
@@ -1535,35 +1534,32 @@ class _PaymentsScreenState extends State<PaymentsScreen>
                       ],
                     ),
 
-                  TextField(
-                    controller: _transactionIdController,
-                    style: const TextStyle(color: Colors.white),
-                    decoration: InputDecoration(
-                      labelText: 'Transaction ID *',
-                      labelStyle: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 13),
-                      filled: true,
-                      fillColor: Colors.white.withOpacity(0.05),
-                      border: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
-                      ),
-                      enabledBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: BorderSide(color: Colors.white.withOpacity(0.1)),
-                      ),
-                      focusedBorder: OutlineInputBorder(
-                        borderRadius: BorderRadius.circular(12),
-                        borderSide: const BorderSide(color: kLivinkeyGreen),
-                      ),
-                      prefixIcon: Icon(Icons.receipt_rounded, color: Colors.white.withOpacity(0.4), size: 20),
+                  Container(
+                    padding: const EdgeInsets.all(12),
+                    margin: const EdgeInsets.only(bottom: 4),
+                    decoration: BoxDecoration(
+                      color: kLivinkeyGreen.withOpacity(0.08),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: kLivinkeyGreen.withOpacity(0.18)),
                     ),
+                    child: Row(children: [
+                      const Icon(Icons.verified_user_rounded, color: kLivinkeyGreen, size: 18),
+                      const SizedBox(width: 10),
+                      Expanded(
+                        child: Text(
+                          'Just attach your payment screenshot. The property team reads the transaction details from it.',
+                          style: TextStyle(color: Colors.white.withOpacity(0.7), fontSize: 12, height: 1.35),
+                        ),
+                      ),
+                    ]),
                   ),
                   const SizedBox(height: 14),
 
                   TextField(
                     controller: _amountController,
                     style: const TextStyle(color: Colors.white),
-                    keyboardType: TextInputType.number,
+                    keyboardType: const TextInputType.numberWithOptions(decimal: true),
+                    inputFormatters: [FilteringTextInputFormatter.allow(RegExp(r'^\d*\.?\d{0,2}'))],
                     decoration: InputDecoration(
                       labelText: 'Amount Paid (₹) *',
                       labelStyle: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 13),
@@ -1647,8 +1643,7 @@ class _PaymentsScreenState extends State<PaymentsScreen>
                       Expanded(
                         child: TextButton(
                           onPressed: _isSubmittingProof ? null : () {
-                            _transactionIdController.clear();
-                            _amountController.clear();
+                                                    _amountController.clear();
                             setState(() => _paymentScreenshotPath = null);
                             Navigator.pop(context);
                           },
@@ -1660,13 +1655,7 @@ class _PaymentsScreenState extends State<PaymentsScreen>
                         flex: 2,
                         child: ElevatedButton(
                           onPressed: _isSubmittingProof ? null : () async {
-                            final transactionId = _transactionIdController.text.trim();
                             final amount = double.tryParse(_amountController.text.trim());
-
-                            if (transactionId.isEmpty) {
-                              SnackbarHelper.showError(context, 'Please enter Transaction ID');
-                              return;
-                            }
 
                             final due = proofScope == 'outstanding'
                                 ? (_currentBill?.totalOutstanding ?? 0)
@@ -1697,7 +1686,6 @@ class _PaymentsScreenState extends State<PaymentsScreen>
                                 billId: proofScope == 'bill' ? (_currentBill?.id ?? 0) : 0,
                                 paymentScope: proofScope,
                                 paymentTargetBillId: proofScope == 'bill' ? (_currentBill?.id ?? 0) : null,
-                                transactionId: transactionId,
                                 amountPaid: amount,
                                 paymentScreenshot: _paymentScreenshotPath!,
                               );
@@ -1840,249 +1828,242 @@ class _PaymentsScreenState extends State<PaymentsScreen>
   // ============================================================
   // FIXED: showPaymentHistory with correct amounts and rejection reason
   // ============================================================
-  void _showPaymentHistory(BuildContext context) {
-    List<PaymentRecord> allPayments = [];
-    
-    if (_paymentHistory != null) {
-      // Add online payments
-      for (final p in _paymentHistory!.onlinePayments) {
-        allPayments.add(PaymentRecord(
+  List<PaymentRecord> _collectPayments() {
+    final all = <PaymentRecord>[];
+    final h = _paymentHistory;
+    if (h == null) return all;
+    PaymentRecord conv(dynamic p, String type, {String? method}) => PaymentRecord(
           id: p.id,
           billId: p.billId,
-          amount: p.amount,
-          paymentMethod: p.paymentMethod,
+          amount: p.amount < 0 ? 0 : p.amount,
+          paymentMethod: method ?? p.paymentMethod,
           transactionId: p.transactionId,
           status: p.status,
           createdAt: p.createdAt,
-          type: 'online',
+          type: type,
           billTotal: p.billTotal,
           adminNotes: p.adminNotes,
           isPartial: p.isPartial,
           dueBeforePayment: p.dueBeforePayment,
           dueAfterPayment: p.dueAfterPayment,
-        ));
-      }
-      
-      // Add cash payments
-      for (final p in _paymentHistory!.cashPayments) {
-        allPayments.add(PaymentRecord(
-          id: p.id,
-          billId: p.billId,
-          amount: p.amount,
-          paymentMethod: 'cash',
-          transactionId: p.transactionId,
-          status: p.status,
-          createdAt: p.createdAt,
-          type: 'cash',
-          billTotal: p.billTotal,
-          adminNotes: p.adminNotes,
-          isPartial: p.isPartial,
-          dueBeforePayment: p.dueBeforePayment,
-          dueAfterPayment: p.dueAfterPayment,
-        ));
-      }
-      
-      // Add payment proofs
-      for (final p in _paymentHistory!.paymentProofs) {
-        allPayments.add(PaymentRecord(
-          id: p.id,
-          billId: p.billId,
-          amount: p.amount,
-          paymentMethod: 'proof',
-          transactionId: p.transactionId,
-          status: p.status,
-          createdAt: p.createdAt,
-          type: 'proof',
-          billTotal: p.billTotal,
-          adminNotes: p.adminNotes,
-          isPartial: p.isPartial,
-          dueBeforePayment: p.dueBeforePayment,
-          dueAfterPayment: p.dueAfterPayment,
-        ));
-      }
+        );
+    for (final p in h.onlinePayments) {
+      all.add(conv(p, 'online'));
     }
+    for (final p in h.cashPayments) {
+      all.add(conv(p, 'cash', method: 'cash'));
+    }
+    for (final p in h.paymentProofs) {
+      all.add(conv(p, 'proof', method: 'proof'));
+    }
+    all.sort((a, b) => b.createdAt.compareTo(a.createdAt));
+    return all;
+  }
+
+  String _friendlyDay(DateTime d) {
+    final now = DateTime.now();
+    final day = DateTime(d.year, d.month, d.day);
+    final diff = DateTime(now.year, now.month, now.day).difference(day).inDays;
+    final time = DateFormat('h:mm a').format(d);
+    if (diff == 0) return 'Today, $time';
+    if (diff == 1) return 'Yesterday, $time';
+    return '${DateFormat('d MMM').format(d)}, $time';
+  }
+
+  String _methodLabel(PaymentRecord p) {
+    switch ((p.type ?? p.paymentMethod).toLowerCase()) {
+      case 'cash':
+        return 'Cash';
+      case 'proof':
+        return 'UPI / Bank transfer';
+      default:
+        return 'Online';
+    }
+  }
+
+  Future<void> _openReceipt(BuildContext context, PaymentRecord payment) {
+    return ReceiptSheet.show(
+      context,
+      payment: payment,
+      onDownload: () => _handleDownloadReceipt(context, payment),
+      tenantName: _paymentHistory?.tenant?.fullName,
+    );
+  }
+
+  void _showPaymentHistory(BuildContext context) {
+    final payments = _collectPayments();
+
+    // Group by month for a statement-like layout.
+    final groups = <String, List<PaymentRecord>>{};
+    for (final p in payments) {
+      groups.putIfAbsent(DateFormat('MMMM yyyy').format(p.createdAt), () => []).add(p);
+    }
+    final totalPaid = payments
+        .where((p) => const ['verified', 'success', 'paid'].contains(p.status.toLowerCase()))
+        .fold<double>(0, (sum, p) => sum + (p.amount < 0 ? 0 : p.amount));
 
     showModalBottomSheet(
       context: context,
       isScrollControlled: true,
-      backgroundColor: const Color(0xFF141414),
+      backgroundColor: const Color(0xFF111111),
       shape: const RoundedRectangleBorder(borderRadius: BorderRadius.vertical(top: Radius.circular(28))),
-      builder: (context) => DraggableScrollableSheet(
-        initialChildSize: 0.85,
+      builder: (sheetContext) => DraggableScrollableSheet(
+        initialChildSize: 0.88,
         minChildSize: 0.5,
-        maxChildSize: 0.95,
+        maxChildSize: 0.96,
         expand: false,
-        builder: (context, scrollController) => Container(
-          padding: const EdgeInsets.fromLTRB(20, 12, 20, 20),
+        builder: (_, scrollController) => Padding(
+          padding: const EdgeInsets.fromLTRB(18, 10, 18, 0),
           child: Column(
             children: [
               Container(
                 width: 40,
                 height: 4,
-                decoration: BoxDecoration(
-                  color: Colors.white.withOpacity(0.2),
-                  borderRadius: BorderRadius.circular(2),
-                ),
+                decoration: BoxDecoration(color: Colors.white.withOpacity(0.2), borderRadius: BorderRadius.circular(2)),
               ),
-              const SizedBox(height: 18),
+              const SizedBox(height: 16),
               Row(
                 children: [
-                  Container(
-                    width: 4,
-                    height: 18,
-                    decoration: BoxDecoration(color: kLivinkeyGreen, borderRadius: BorderRadius.circular(2)),
-                  ),
-                  const SizedBox(width: 8),
-                  const Text('Payment History', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w800)),
+                  const Text('Payment history', style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.w800)),
                   const Spacer(),
-                  Text(
-                    '${allPayments.length} payments',
-                    style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 12),
+                  IconButton(
+                    onPressed: () => Navigator.pop(sheetContext),
+                    icon: Icon(Icons.close_rounded, color: Colors.white.withOpacity(0.6)),
                   ),
                 ],
               ),
-              const SizedBox(height: 16),
+              if (payments.isNotEmpty) ...[
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(16),
+                  decoration: BoxDecoration(
+                    gradient: LinearGradient(colors: [kLivinkeyGreen.withOpacity(0.18), kLivinkeyGreen.withOpacity(0.05)]),
+                    borderRadius: BorderRadius.circular(18),
+                    border: Border.all(color: kLivinkeyGreen.withOpacity(0.25)),
+                  ),
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text('Total paid', style: TextStyle(color: Colors.white.withOpacity(0.6), fontSize: 12)),
+                            const SizedBox(height: 2),
+                            Text(fmtINR(totalPaid), style: const TextStyle(color: Colors.white, fontSize: 22, fontWeight: FontWeight.w800)),
+                          ],
+                        ),
+                      ),
+                      Text('${payments.length} ${payments.length == 1 ? 'payment' : 'payments'}',
+                          style: TextStyle(color: Colors.white.withOpacity(0.55), fontSize: 12)),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 10),
+              ],
               Expanded(
-                child: allPayments.isEmpty
+                child: payments.isEmpty
                     ? Center(
-                        child: Text(
-                          'No payment history',
-                          style: TextStyle(color: Colors.white.withOpacity(0.3), fontSize: 14),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Container(
+                              padding: const EdgeInsets.all(22),
+                              decoration: BoxDecoration(color: Colors.white.withOpacity(0.05), shape: BoxShape.circle),
+                              child: Icon(Icons.receipt_long_rounded, size: 40, color: Colors.white.withOpacity(0.35)),
+                            ),
+                            const SizedBox(height: 16),
+                            const Text('No payments yet', style: TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700)),
+                            const SizedBox(height: 6),
+                            Text('Your payments and receipts will appear here.',
+                                style: TextStyle(color: Colors.white.withOpacity(0.45), fontSize: 13)),
+                          ],
                         ),
                       )
-                    : ListView.separated(
+                    : ListView(
                         controller: scrollController,
-                        itemCount: allPayments.length,
-                        separatorBuilder: (context, index) => Divider(color: Colors.white.withOpacity(0.05), height: 1),
-                        itemBuilder: (context, index) {
-                          final payment = allPayments[index];
-                          final isPaid = payment.status == 'verified' || payment.status == 'success' || payment.status == 'paid';
-                          final isRejected = payment.status == 'rejected';
-                          final isPending = payment.status == 'pending';
-                          final statusColor = isPaid ? kLivinkeyGreen : (isRejected ? Colors.red : Colors.orange);
-                          
-                          String statusLabel = payment.status;
-                          if (statusLabel == 'verified') statusLabel = 'Verified';
-                          else if (statusLabel == 'success') statusLabel = 'Success';
-                          else if (statusLabel == 'paid') statusLabel = 'Paid';
-                          else if (statusLabel == 'rejected') statusLabel = 'Rejected';
-                          else if (statusLabel == 'pending') statusLabel = 'Pending';
-
-                          return Container(
-                            padding: const EdgeInsets.symmetric(vertical: 14),
-                            child: Row(
-                              children: [
-                                Container(
-                                  padding: const EdgeInsets.all(11),
-                                  decoration: BoxDecoration(
-                                    color: statusColor.withOpacity(0.12),
-                                    borderRadius: BorderRadius.circular(14),
-                                  ),
-                                  child: Icon(
-                                    isPaid ? Icons.check_circle_rounded : (isRejected ? Icons.cancel_rounded : Icons.pending_rounded),
-                                    color: statusColor,
-                                    size: 22,
-                                  ),
-                                ),
-                                const SizedBox(width: 14),
-                                Expanded(
-                                  child: Column(
-                                    crossAxisAlignment: CrossAxisAlignment.start,
-                                    children: [
-                                      Row(
-                                        children: [
-                                          Text(
-                                            fmtINR(payment.amount),
-                                            style: const TextStyle(color: Colors.white, fontSize: 16, fontWeight: FontWeight.w700),
-                                          ),
-                                          const SizedBox(width: 10),
-                                          Container(
-                                            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
-                                            decoration: BoxDecoration(
-                                              color: statusColor.withOpacity(0.15),
-                                              borderRadius: BorderRadius.circular(6),
-                                            ),
-                                            child: Text(
-                                              statusLabel.toUpperCase(),
-                                              style: TextStyle(color: statusColor, fontSize: 10, fontWeight: FontWeight.w600),
-                                            ),
-                                          ),
-                                        ],
-                                      ),
-                                      const SizedBox(height: 2),
-                                      Text(
-                                        '${DateFormat('dd MMM, yyyy').format(payment.createdAt)} • ${payment.paymentMethod}',
-                                        style: TextStyle(color: Colors.white.withOpacity(0.42), fontSize: 12),
-                                      ),
-                                      if (payment.transactionId != null && payment.transactionId!.isNotEmpty)
-                                        Text(
-                                          payment.transactionId!,
-                                          style: TextStyle(color: Colors.white.withOpacity(0.22), fontSize: 10),
-                                        ),
-                                      if (payment.dueAfterPayment != null)
-                                        Text(
-                                          'Remaining balance: ${fmtINR(payment.dueAfterPayment!)}',
-                                          style: TextStyle(color: Colors.white.withOpacity(0.32), fontSize: 11),
-                                        ),
-                                      // ============================================================
-                                      // FIXED: Show rejection reason when status is rejected
-                                      // ============================================================
-                                      if (isRejected && payment.adminNotes != null && payment.adminNotes!.isNotEmpty)
-                                        Container(
-                                          margin: const EdgeInsets.only(top: 4),
-                                          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-                                          decoration: BoxDecoration(
-                                            color: Colors.red.withOpacity(0.1),
-                                            borderRadius: BorderRadius.circular(6),
-                                            border: Border.all(color: Colors.red.withOpacity(0.2)),
-                                          ),
-                                          child: Row(
-                                            crossAxisAlignment: CrossAxisAlignment.start,
-                                            children: [
-                                              Icon(Icons.info_outline, color: Colors.red, size: 14),
-                                              const SizedBox(width: 6),
-                                              Expanded(
-                                                child: Text(
-                                                  'Reason: ${payment.adminNotes}',
-                                                  style: TextStyle(color: Colors.red.withOpacity(0.8), fontSize: 12),
-                                                ),
-                                              ),
-                                            ],
-                                          ),
-                                        ),
-                                    ],
-                                  ),
-                                ),
-                if (isPaid) ElevatedButton(
-                  onPressed: _isDownloadingReceipt && _downloadingReceiptId == payment.id
-                      ? null
-                      : () => _handleDownloadReceipt(context, payment),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: kLivinkeyGreen,
-                    foregroundColor: Colors.black,
-                    elevation: 0,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
-                    padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
-                    minimumSize: const Size(80, 32),
-                  ),
-                  child: _isDownloadingReceipt && _downloadingReceiptId == payment.id
-                      ? const SizedBox(
-                          height: 16,
-                          width: 16,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor: AlwaysStoppedAnimation<Color>(Colors.black),
-                          ),
-                        )
-                      : const Text('Receipt', style: TextStyle(fontWeight: FontWeight.w700, fontSize: 11)),
-                ),
-                              ],
+                        padding: const EdgeInsets.only(bottom: 24),
+                        children: [
+                          for (final entry in groups.entries) ...[
+                            Padding(
+                              padding: const EdgeInsets.only(top: 14, bottom: 8),
+                              child: Text(entry.key.toUpperCase(),
+                                  style: TextStyle(color: Colors.white.withOpacity(0.4), fontSize: 11, letterSpacing: 1.4, fontWeight: FontWeight.w700)),
                             ),
-                          );
-                        },
+                            for (final payment in entry.value) _historyTile(sheetContext, payment),
+                          ],
+                        ],
                       ),
               ),
             ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _historyTile(BuildContext sheetContext, PaymentRecord payment) {
+    final status = payment.status.toLowerCase();
+    final isPaid = const ['verified', 'success', 'paid'].contains(status);
+    final isRejected = status == 'rejected';
+    final color = isPaid ? kLivinkeyGreen : (isRejected ? const Color(0xFFEF5350) : const Color(0xFFFFA726));
+    final label = isPaid ? 'Paid' : (isRejected ? 'Rejected' : 'Pending');
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 10),
+      child: Material(
+        color: Colors.white.withOpacity(0.04),
+        borderRadius: BorderRadius.circular(16),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(16),
+          onTap: () => _openReceipt(sheetContext, payment),
+          child: Padding(
+            padding: const EdgeInsets.all(14),
+            child: Row(
+              children: [
+                Container(
+                  width: 44,
+                  height: 44,
+                  decoration: BoxDecoration(color: color.withOpacity(0.14), borderRadius: BorderRadius.circular(14)),
+                  child: Icon(
+                    isPaid ? Icons.check_rounded : (isRejected ? Icons.close_rounded : Icons.schedule_rounded),
+                    color: color,
+                  ),
+                ),
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(_methodLabel(payment), style: const TextStyle(color: Colors.white, fontSize: 14, fontWeight: FontWeight.w700)),
+                      const SizedBox(height: 2),
+                      Text(_friendlyDay(payment.createdAt.toLocal()),
+                          style: TextStyle(color: Colors.white.withOpacity(0.45), fontSize: 12)),
+                      if (isRejected && (payment.adminNotes ?? '').isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 4),
+                          child: Text(payment.adminNotes!,
+                              maxLines: 2,
+                              overflow: TextOverflow.ellipsis,
+                              style: const TextStyle(color: Color(0xFFEF5350), fontSize: 11.5)),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Column(
+                  crossAxisAlignment: CrossAxisAlignment.end,
+                  children: [
+                    Text(fmtINR(payment.amount < 0 ? 0 : payment.amount),
+                        style: const TextStyle(color: Colors.white, fontSize: 15, fontWeight: FontWeight.w800)),
+                    const SizedBox(height: 4),
+                    Container(
+                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                      decoration: BoxDecoration(color: color.withOpacity(0.14), borderRadius: BorderRadius.circular(6)),
+                      child: Text(label, style: TextStyle(color: color, fontSize: 10.5, fontWeight: FontWeight.w700)),
+                    ),
+                  ],
+                ),
+              ],
+            ),
           ),
         ),
       ),
@@ -2155,112 +2136,6 @@ class _PaymentsScreenState extends State<PaymentsScreen>
   }
 }
 
-  void _showReceiptPreview(BuildContext context, PaymentRecord payment) {
-    showDialog(
-      context: context,
-      builder: (context) => Dialog(
-        backgroundColor: const Color(0xFF141414),
-        shape: RoundedRectangleBorder(
-          borderRadius: BorderRadius.circular(24),
-          side: BorderSide(color: Colors.white.withOpacity(0.06)),
-        ),
-        child: Container(
-          padding: const EdgeInsets.all(26),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              const Text('Payment Receipt', style: TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.w800)),
-              const SizedBox(height: 18),
-              Container(
-                width: double.infinity,
-                padding: const EdgeInsets.all(20),
-                decoration: BoxDecoration(
-                  gradient: LinearGradient(
-                    begin: Alignment.topLeft,
-                    end: Alignment.bottomRight,
-                    colors: [kLivinkeyGreen.withOpacity(0.1), Colors.white.withOpacity(0.02)],
-                  ),
-                  borderRadius: BorderRadius.circular(16),
-                  border: Border.all(color: kLivinkeyGreen.withOpacity(0.14)),
-                ),
-                child: Column(
-                  children: [
-                    _buildReceiptRow('Amount', fmtINR(payment.amount)),
-                    _buildReceiptRow('Date', DateFormat('dd MMM, yyyy').format(payment.createdAt)),
-                    if (payment.transactionId != null) _buildReceiptRow('Transaction ID', payment.transactionId!),
-                    _buildReceiptRow('Payment Mode', payment.paymentMethod),
-                    _buildReceiptRow('Status', payment.status, isStatus: true),
-                    if (payment.status == 'rejected' && payment.adminNotes != null && payment.adminNotes!.isNotEmpty)
-                      _buildReceiptRow('Rejection Reason', payment.adminNotes!, isStatus: true, isRejectionReason: true),
-                  ],
-                ),
-              ),
-              const SizedBox(height: 18),
-              SizedBox(
-                width: double.infinity,
-                child: ElevatedButton.icon(
-                  onPressed: () => _handleDownloadReceipt(context, payment),
-                  icon: _isDownloadingReceipt && _downloadingReceiptId == payment.id
-                      ? const SizedBox(
-                          height: 20,
-                          width: 20,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            valueColor: AlwaysStoppedAnimation<Color>(Colors.black),
-                          ),
-                        )
-                      : const Icon(Icons.download_rounded, color: Colors.black, size: 20),
-                  label: Text(
-                    _isDownloadingReceipt && _downloadingReceiptId == payment.id
-                        ? 'Downloading...'
-                        : 'Download Receipt',
-                    style: const TextStyle(color: Colors.black, fontWeight: FontWeight.w700),
-                  ),
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: kLivinkeyGreen,
-                    elevation: 0,
-                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
-                    padding: const EdgeInsets.symmetric(vertical: 14),
-                  ),
-                ),
-              ),
-              const SizedBox(height: 6),
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: Text('Close', style: TextStyle(color: Colors.white.withOpacity(0.5))),
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ============================================================
-  // FIXED: _buildReceiptRow - NO icon or child parameters
-  // ============================================================
-  Widget _buildReceiptRow(String label, String value, {bool isStatus = false, bool isRejectionReason = false}) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 7),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
-        children: [
-          Text(label, style: TextStyle(color: Colors.white.withOpacity(0.5), fontSize: 13)),
-          Text(
-            value,
-            style: TextStyle(
-              color: isStatus 
-                  ? (value.toLowerCase().contains('rejected') ? Colors.red : kLivinkeyGreen) 
-                  : (isRejectionReason ? Colors.red : Colors.white),
-              fontSize: 13,
-              fontWeight: isStatus || isRejectionReason ? FontWeight.w700 : FontWeight.w600,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
   Future<void> _launchWhatsApp() async {
     try {
       if (await canLaunchUrl(Uri.parse(kWhatsAppUrl))) {
@@ -2271,5 +2146,7 @@ class _PaymentsScreenState extends State<PaymentsScreen>
 }
 
 String fmtINR(double amount) {
-  return '₹${NumberFormat('#,##,##0.00', 'en_IN').format(amount)}';
+  // Never show negative / NaN money to a tenant.
+  final value = (amount.isNaN || amount.isInfinite || amount < 0) ? 0.0 : amount;
+  return '₹${NumberFormat('#,##,##0.00', 'en_IN').format(value)}';
 }
