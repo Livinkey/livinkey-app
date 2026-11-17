@@ -11,6 +11,7 @@ import 'screens/auth/login_screen.dart';
 import 'screens/tenant/tenant_screen.dart';
 import 'screens/guest/guest_screen.dart';
 import 'services/api_service.dart';
+import 'services/deep_link_service.dart';
 import 'services/app_events.dart';
 import 'models/auth_models.dart';
 import 'widgets/livinkey_logo.dart' hide kLivinkeyBlack, kLivinkeyGreen;
@@ -25,6 +26,7 @@ void main() async {
   await pushService.initializeFirebaseOnly();
 
   runApp(const LivinkeyApp());
+  DeepLinkService().init();
 }
 
 class LivinkeyApp extends StatelessWidget {

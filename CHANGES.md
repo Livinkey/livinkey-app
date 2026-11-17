@@ -1,12 +1,12 @@
 # Livinkey – security & app overhaul (what changed and what you must do)
 
 ## Do these first (cannot be done from code)
-1. **Rotate every secret** you previously shared (DB password, JWT_SECRET, Gmail app password, Cloudinary, Twilio, Razorpay, Firebase service account). Make JWT_SECRET a random 48+ character string. Keep `backend/.env` OUT of git and out of zip files you share. The app folder also contained a *server* Firebase service-account JSON – it has been removed; revoke that key.
-2. **Set real values** in `backend/.env`: `MERCHANT_UPI_ID` (currently the placeholder `your_merchant@upi`), `TWILIO_AUTH_TOKEN`, and (if using Razorpay) `RAZORPAY_WEBHOOK_SECRET`.
+1. **Rotate every secret** you previously shared (DB password, JWT_SECRET, Gmail app password, Cloudinary, Bigtos, Razorpay, Firebase service account). Make JWT_SECRET a random 48+ character string. Keep `backend/.env` OUT of git and out of zip files you share. The app folder also contained a *server* Firebase service-account JSON – it has been removed; revoke that key.
+2. **Set real values** in `backend/.env`: `MERCHANT_UPI_ID` (currently the placeholder `your_merchant@upi`), `BIGTOS_API_KEY`, and (if using Razorpay) `RAZORPAY_WEBHOOK_SECRET`.
 3. **Gateway webhooks** – point them to the new verified endpoints:
    - Razorpay → `https://api.livinkey.com/api/payments/webhook/razorpay` (events: payment.captured, order.paid, payment.failed; use the webhook secret above)
    - Cashfree → `https://api.livinkey.com/api/payments/webhook/cashfree`
-   - Twilio → `https://api.livinkey.com/api/webhooks/twilio/whatsapp` and `/status` (Twilio must call exactly the PUBLIC_API_URL host)
+   - Bigtos → `https://api.livinkey.com/api/webhooks/bigtos/whatsapp?token=<BIGTOS_WEBHOOK_SECRET>`
 4. **Mobile app**: run `flutter pub get` (new dependency `flutter_secure_storage`), then `flutter build appbundle`. Version bumped to 1.0.1+10.
 5. Deploy backend + admin + website together (admin/app use the new download-token and error-code responses).
 
@@ -18,7 +18,7 @@
 - Brute-force protection: per-account lockouts for login and OTP (5 wrong OTPs wipes the OTP), plus IP rate limits (API, auth, public, webhooks). Cryptographically secure OTPs and temporary passwords.
 - Password policy (8+, letter+number) for admin, tenant, guest; no more account enumeration on OTP/forgot-password.
 - Payments: Cashfree webhook signature (HMAC + timestamp) and Razorpay webhook-secret verification **before** any DB work; gateway amount must match the transaction; fixed Cashfree notify/return URLs.
-- Twilio webhooks verify `X-Twilio-Signature`; raw payloads no longer stored.
+- Bigtos webhook is protected by a shared secret (`BIGTOS_WEBHOOK_SECRET`); raw payloads no longer stored.
 - CORS restricted to livinkey.com / www / admin (+ `CORS_ORIGINS`); helmet; tokens redacted from logs.
 - Uploads: images + PDF only, magic-byte verified; friendly size errors.
 - Internal/SQL error text is never returned to clients; graceful shutdown; larger DB pool; startup config warnings.

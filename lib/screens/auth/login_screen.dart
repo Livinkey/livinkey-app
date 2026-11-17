@@ -11,6 +11,7 @@ import '../../services/session_manager.dart';
 import '../../services/notification_service.dart';
 import '../../services/push_notification_service.dart';
 import '../../services/saved_credentials.dart';
+import '../../services/deep_link_service.dart';
 import '../../utils/constants.dart';
 import '../../utils/helpers.dart';
 import '../../widgets/common/snackbar_helper.dart';
@@ -171,6 +172,13 @@ class _LoginScreenState extends State<LoginScreen>
     return emailRegex.hasMatch(email);
   }
 
+  /// A phone number: optional +, then 7-15 digits (spaces, dashes and brackets allowed).
+  bool _isValidPhone(String value) {
+    if (!RegExp(r'^\+?[0-9\s\-()]{7,20}$').hasMatch(value)) return false;
+    final digits = value.replaceAll(RegExp(r'[^0-9]'), '');
+    return digits.length >= 7 && digits.length <= 15;
+  }
+
   // ============================================================
   // FIXED: Login handler with push notification initialization AFTER login
   // ============================================================
@@ -203,12 +211,12 @@ class _LoginScreenState extends State<LoginScreen>
     final String password = _passwordController.text.trim();
 
     if (email.isEmpty) {
-      SnackbarHelper.showError(context, 'Please enter your email address');
+      SnackbarHelper.showError(context, 'Please enter your email or phone number');
       return;
     }
 
-    if (!_isValidEmail(email)) {
-      SnackbarHelper.showError(context, 'Please enter a valid email address');
+    if (!_isValidEmail(email) && !_isValidPhone(email)) {
+      SnackbarHelper.showError(context, 'Please enter a valid email address or phone number');
       return;
     }
 
@@ -334,6 +342,7 @@ class _LoginScreenState extends State<LoginScreen>
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => const TenantScreen()),
         );
+        DeepLinkService().consumePending(); // opens the screen the tapped link pointed to
       } else if (response.user!.role == 'guest') {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(builder: (_) => const GuestScreen()),
@@ -584,9 +593,9 @@ class _LoginScreenState extends State<LoginScreen>
                           // Email Field
                           _buildTextField(
                             controller: _emailController,
-                            label: 'Email Address',
-                            icon: Icons.email_outlined,
-                            keyboardType: TextInputType.emailAddress,
+                            label: 'Email or Phone Number',
+                            icon: Icons.person_outline,
+                            keyboardType: TextInputType.text,
                             textInputAction: TextInputAction.next,
                             autofillHints: const [
                               AutofillHints.username,

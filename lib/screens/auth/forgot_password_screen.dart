@@ -151,16 +151,22 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen>
     return emailRegex.hasMatch(email);
   }
 
+  bool _isValidPhone(String value) {
+    if (!RegExp(r'^\+?[0-9\s\-()]{7,20}$').hasMatch(value)) return false;
+    final digits = value.replaceAll(RegExp(r'[^0-9]'), '');
+    return digits.length >= 7 && digits.length <= 15;
+  }
+
   Future<void> _handleSendOTP() async {
     final String email = _emailController.text.trim();
 
     if (email.isEmpty) {
-      SnackbarHelper.showError(context, 'Please enter your email address');
+      SnackbarHelper.showError(context, 'Please enter your email or phone number');
       return;
     }
 
-    if (!_isValidEmail(email)) {
-      SnackbarHelper.showError(context, 'Please enter a valid email address');
+    if (!_isValidEmail(email) && !_isValidPhone(email)) {
+      SnackbarHelper.showError(context, 'Please enter a valid email address or phone number');
       return;
     }
 
@@ -355,7 +361,7 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen>
   String _getStepSubtitle() {
     switch (_currentStep) {
       case 0:
-        return 'Enter your registered email to receive an OTP on WhatsApp, SMS or email';
+        return 'Enter your registered email or phone number to receive an OTP on WhatsApp (or email)';
       case 1:
         return 'Enter the OTP sent to your WhatsApp, SMS or email';
       case 2:
@@ -765,11 +771,11 @@ class _ForgotPasswordScreenState extends State<ForgotPasswordScreen>
           child: TextField(
             controller: _emailController,
             style: const TextStyle(color: Colors.white),
-            keyboardType: TextInputType.emailAddress,
+            keyboardType: TextInputType.text,
             textInputAction: TextInputAction.done,
             onSubmitted: (_) => _handleSendOTP(),
             decoration: InputDecoration(
-              labelText: 'Email Address',
+              labelText: 'Email or Phone Number',
               labelStyle: TextStyle(
                 color: Colors.white.withOpacity(0.5),
                 fontWeight: FontWeight.w500,
