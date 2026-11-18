@@ -1246,15 +1246,16 @@ class ApiService {
         MultipartFile file;
         
         if (kIsWeb) {
-          if (filePath.startsWith('data:image')) {
+          if (filePath.startsWith('data:image') || filePath.startsWith('data:application/pdf')) {
             final parts = filePath.split(',');
             if (parts.length == 2) {
               final bytes = base64Decode(parts[1]);
+              final isPdfData = filePath.startsWith('data:application/pdf');
               if (bytes.isNotEmpty) {
                 file = MultipartFile.fromBytes(
                   bytes,
-                  filename: 'doc_${DateTime.now().millisecondsSinceEpoch}.jpg',
-                  contentType: DioMediaType('image', 'jpeg'),
+                  filename: 'doc_${DateTime.now().millisecondsSinceEpoch}.${isPdfData ? 'pdf' : 'jpg'}',
+                  contentType: isPdfData ? DioMediaType('application', 'pdf') : DioMediaType('image', 'jpeg'),
                 );
               } else {
                 return {'success': false, 'message': 'Empty image data'};
@@ -1300,6 +1301,7 @@ class ApiService {
             file = MultipartFile.fromBytes(
               bytes,
               filename: 'doc_${DateTime.now().millisecondsSinceEpoch}.$extension',
+              contentType: extension.toLowerCase() == 'pdf' ? DioMediaType('application', 'pdf') : null,
             );
           } else {
             return {'success': false, 'message': 'File does not exist: $filePath'};

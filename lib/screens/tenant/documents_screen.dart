@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:image_picker/image_picker.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:open_filex/open_filex.dart';
@@ -181,16 +182,18 @@ class _DocumentsScreenState extends State<DocumentsScreen>
         {'label': 'C-Form', 'key': 'c_form', 'required': true},
         {'label': 'E-FRRO', 'key': 'efrro', 'required': true},
         {'label': 'University ID', 'key': 'university_id', 'required': false},
-        {'label': 'Agreement', 'key': 'agreement', 'required': true},
+        {'label': 'Agreement', 'key': 'agreement', 'required': true, 'pdfOnly': true},
       ];
     } else {
       return [
         {'label': 'Passport Size Photo', 'key': 'passport_photo', 'required': true},
         {'label': 'Signature', 'key': 'signature', 'required': true},
-        {'label': 'Tenant Aadhaar Card', 'key': 'tenant_aadhaar', 'required': true},
-        {'label': 'Parent Aadhaar Card', 'key': 'parent_aadhaar', 'required': true},
+        {'label': 'Tenant Aadhaar Card (Front)', 'key': 'tenant_aadhaar_front', 'required': true},
+        {'label': 'Tenant Aadhaar Card (Back)', 'key': 'tenant_aadhaar_back', 'required': true},
+        {'label': 'Parent Aadhaar Card (Front)', 'key': 'parent_aadhaar_front', 'required': true},
+        {'label': 'Parent Aadhaar Card (Back)', 'key': 'parent_aadhaar_back', 'required': true},
         {'label': 'University ID', 'key': 'university_id', 'required': false},
-        {'label': 'Agreement', 'key': 'agreement', 'required': true},
+        {'label': 'Agreement', 'key': 'agreement', 'required': true, 'pdfOnly': true},
       ];
     }
   }
@@ -218,16 +221,29 @@ class _DocumentsScreenState extends State<DocumentsScreen>
     return _getFallbackDocuments(_residency);
   }
 
-  bool _hasDocument(String key) {
-    return _uploadedDocuments.any((doc) => doc['document_type'] == key);
-  }
+  // Older single-sided Aadhaar uploads (made before front/back existed) count as the FRONT side.
+  static const Map<String, String> _legacyAlias = {
+    'tenant_aadhaar_front': 'tenant_aadhaar',
+    'parent_aadhaar_front': 'parent_aadhaar',
+  };
+
+  /// The agreement has several pages, so it is uploaded as ONE PDF (every other document is a photo).
+  bool _isPdfOnly(Map<String, dynamic> doc) =>
+      doc['pdfOnly'] == true || doc['pdf_only'] == true || doc['key'] == 'agreement';
+
+  bool _hasDocument(String key) => _getDocument(key) != null;
 
   Map<String, dynamic>? _getDocument(String key) {
-    try {
-      return _uploadedDocuments.firstWhere((doc) => doc['document_type'] == key);
-    } catch (e) {
-      return null;
+    for (final doc in _uploadedDocuments) {
+      if (doc['document_type'] == key) return doc;
     }
+    final legacy = _legacyAlias[key];
+    if (legacy != null) {
+      for (final doc in _uploadedDocuments) {
+        if (doc['document_type'] == legacy) return doc;
+      }
+    }
+    return null;
   }
 
   void _toggleSelection(int index) {
@@ -333,8 +349,75 @@ class _DocumentsScreenState extends State<DocumentsScreen>
   }
 
 
-  // Agreement is uploaded as an image (same as passport, signature, etc.)
+  /// Agreement: pick ONE PDF (it has more than one page) and upload it.
+  Future<void> _pickAndUploadPdf(Map<String, dynamic> doc) async {
+    FilePickerResult? picked;
+    try {
+      picked = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['pdf'],
+        allowMultiple: false,
+        withData: kIsWeb,
+      );
+    } catch (e) {
+      if (mounted) SnackbarHelper.showError(context, 'Could not open the file picker');
+      return;
+    }
+    if (picked == null || picked.files.isEmpty || !mounted) return;
+
+    final file = picked.files.first;
+    if (!(file.name.toLowerCase().endsWith('.pdf'))) {
+      SnackbarHelper.showError(context, 'The agreement must be a PDF file.');
+      return;
+    }
+    if (file.size > 5 * 1024 * 1024) {
+      SnackbarHelper.showError(context, 'The PDF is larger than 5 MB. Please compress it and try again.');
+      return;
+    }
+
+    setState(() => _isUploading = true);
+    try {
+      String fileData;
+      if (kIsWeb) {
+        final bytes = file.bytes;
+        if (bytes == null || bytes.isEmpty) {
+          SnackbarHelper.showError(context, 'Could not read the PDF. Please try again.');
+          return;
+        }
+        fileData = 'data:application/pdf;base64,${base64Encode(bytes)}';
+      } else {
+        if (file.path == null) {
+          SnackbarHelper.showError(context, 'Could not read the PDF. Please try again.');
+          return;
+        }
+        fileData = file.path!;
+      }
+
+      final response = await _api.uploadDocument(
+        documentType: doc['key'],
+        filePath: fileData,
+      );
+      if (!mounted) return;
+      if (response['success'] == true) {
+        SnackbarHelper.showSuccess(context, '${doc['label']} uploaded successfully!');
+        await _loadDocuments();
+      } else {
+        SnackbarHelper.showError(context, (response['message'] ?? 'Upload failed. Please try again.').toString());
+      }
+    } catch (e) {
+      if (mounted) SnackbarHelper.showError(context, 'An error occurred. Please try again.');
+    } finally {
+      if (mounted) setState(() => _isUploading = false);
+    }
+  }
+
+  // Photos (passport photo, signature, Aadhaar sides ...) come from the camera/gallery;
+  // the agreement is a multi-page PDF and goes through _pickAndUploadPdf.
   Future<void> _showUploadDialog(Map<String, dynamic> doc) async {
+    if (_isPdfOnly(doc)) {
+      await _pickAndUploadPdf(doc);
+      return;
+    }
     final source = await showModalBottomSheet<ImageSource>(
       context: context,
       backgroundColor: const Color(0xFF141414),
@@ -513,7 +596,12 @@ class _DocumentsScreenState extends State<DocumentsScreen>
   }
 
   void _showDocumentPreview(Map<String, dynamic> doc) {
-    final docType = doc['document_type']?.toString().replaceAll('_', ' ').toUpperCase() ?? 'Document';
+    final String typeKey = doc['document_type']?.toString() ?? '';
+    final String? knownLabel = _docs
+        .where((d) => d['key'] == typeKey || _legacyAlias[d['key']] == typeKey)
+        .map((d) => d['label']?.toString())
+        .firstWhere((l) => l != null && l.isNotEmpty, orElse: () => null);
+    final docType = knownLabel ?? (typeKey.isEmpty ? 'Document' : typeKey.replaceAll('_', ' '));
     final docUrl = doc['document_url']?.toString();
     final lowerUrl = (docUrl ?? '').toLowerCase();
     final mime = (doc['mime_type'] ?? doc['file_type'] ?? '').toString().toLowerCase();
@@ -1292,6 +1380,10 @@ class _DocumentsScreenState extends State<DocumentsScreen>
         return '🎓';
       case 'tenant_aadhaar':
       case 'parent_aadhaar':
+      case 'tenant_aadhaar_front':
+      case 'tenant_aadhaar_back':
+      case 'parent_aadhaar_front':
+      case 'parent_aadhaar_back':
         return '🪪';
       default:
         return '📄';
